@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish all three packages (false only validates and dry-runs)
+        description: Publish all three packages (false only checks packaging; true also runs validation)
         type: boolean
         default: false
 
@@ -34,7 +34,9 @@ jobs:
           scope: "@2mangoes"
       - run: npm ci
       - run: npm run check
+        if: inputs.publish
       - run: ./scripts/test-linux.sh
+        if: inputs.publish
       - name: Dry-run every package before publishing any
         run: |
           npm publish --workspace=@2mangoes/sightread --dry-run

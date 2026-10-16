@@ -15,9 +15,9 @@ directly with Bun; there is no build step.
 3. Commit and push the intended release changes to the fork's `main` branch.
    Do not include local skills, credentials, or private Operator memory.
 4. In the fork's **Actions → Publish GitHub Packages → Run workflow**, select
-   `main` and leave **publish** unchecked. This installs dependencies, checks
-   the source, runs the supported Linux suite, and dry-runs every package.
-   It uploads nothing.
+   `main` and leave **publish** unchecked. This installs dependencies and
+   dry-runs every package without repeating source checks or the Linux suite.
+   It uploads nothing; it checks packaging, not release readiness.
 
 The workflow refuses other repositories and branches. It uses the repository's
 automatic `GITHUB_TOKEN` with `contents: read` and `packages: write`; no PAT
@@ -27,7 +27,8 @@ writes. Existing packages must grant this repository Actions access.
 ## Publish explicitly
 
 After reviewing the dry run, run the same workflow with **publish** checked.
-It repeats validation and publishes sightread, shorthand-code, then pi-shorthand.
+Only this mode runs source checks and the supported Linux suite before
+publishing sightread, shorthand-code, then pi-shorthand.
 Nothing publishes on push, tag creation, or GitHub release creation.
 
 Publication is not atomic: if a later upload fails, earlier uploads remain.
