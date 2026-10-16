@@ -1,0 +1,50 @@
+name: Publish GitHub Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish all three packages (false only validates and dry-runs)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-packages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == '2mangoes/shortsight' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: "@2mangoes"
+      - run: npm ci
+      - run: npm run check
+      - run: ./scripts/test-linux.sh
+      - name: Dry-run every package before publishing any
+        run: |
+          npm publish --workspace=@2mangoes/sightread --dry-run
+          npm publish --workspace=@2mangoes/shorthand-code --dry-run
+          npm publish --workspace=@2mangoes/pi-shorthand --dry-run
+      - name: Publish in dependency order
+        if: inputs.publish
+        run: |
+          npm publish --workspace=@2mangoes/sightread
+          npm publish --workspace=@2mangoes/shorthand-code
+          npm publish --workspace=@2mangoes/pi-shorthand
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

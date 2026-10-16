@@ -1,5 +1,5 @@
 {
-	"name": "pi-shorthand",
+	"name": "@2mangoes/pi-shorthand",
 	"version": "0.14.0",
 	"description": "Pi tool for editing repositories with Bun programs, with first-class support for TypeScript and JavaScript.",
 	"keywords": [
@@ -11,13 +11,13 @@
 		"pi-extension",
 		"pi-package"
 	],
-	"homepage": "https://github.com/sebinsua/shortsight/tree/main/packages/pi-shorthand#readme",
-	"bugs": "https://github.com/sebinsua/shortsight/issues",
+	"homepage": "https://github.com/2mangoes/shortsight/tree/main/packages/pi-shorthand#readme",
+	"bugs": "https://github.com/2mangoes/shortsight/issues",
 	"license": "MIT",
 	"author": "Seb Insua",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/sebinsua/shortsight.git",
+		"url": "git+https://github.com/2mangoes/shortsight.git",
 		"directory": "packages/pi-shorthand"
 	},
 	"files": [
@@ -25,8 +25,11 @@
 		"README.md"
 	],
 	"type": "module",
+	"publishConfig": {
+		"registry": "https://npm.pkg.github.com"
+	},
 	"dependencies": {
-		"shorthand-code": "0.14.0"
+		"@2mangoes/shorthand-code": "0.14.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
@@ -55,6 +58,6 @@
 		"extensions": [
 			"./src/index.ts"
 		],
-		"image": "https://raw.githubusercontent.com/sebinsua/shortsight/main/docs/shorthand.png"
+		"image": "https://raw.githubusercontent.com/2mangoes/shortsight/main/docs/shorthand.png"
 	}
 }

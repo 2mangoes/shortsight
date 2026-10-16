@@ -322,7 +322,7 @@ test("a graph the caller doesn't offer reports that it is disabled", async () =>
 }, 45_000);
 
 const importer = (specifier: string) =>
-	specifier === "sightread" ? Promise.reject(new Error("unavailable")) : import(specifier);
+	specifier === "@2mangoes/sightread" ? Promise.reject(new Error("unavailable")) : import(specifier);
 
 function proxyReply(path: string, request: string, waitForClose = false): Promise<{ error?: string; value?: unknown }> {
 	return new Promise((done, reject) => {
@@ -427,10 +427,22 @@ test("resolver follows a global sightread symlink, and reports absence", async (
 	expect(await resolveSightread({ importer, executable: null, cache: false })).toBeUndefined();
 });
 
+test("resolver rejects upstream unscoped sightread on PATH even at the matching version", async () => {
+	const fake = await mkdtemp(join(root, "upstream-"));
+	const { version } = (await Bun.file(join(import.meta.dir, "../package.json")).json()) as { version: string };
+	await Bun.write(join(fake, "package.json"), JSON.stringify({ name: "sightread", version }));
+	await Bun.write(join(fake, "sightread"), "");
+	try {
+		expect(await resolveSightread({ importer, executable: join(fake, "sightread"), cache: false })).toBeUndefined();
+	} finally {
+		await rm(fake, { recursive: true, force: true });
+	}
+});
+
 test("resolver uses matching PATH sightread after an outdated import", async () => {
 	const fake = join(root, `outdated-${crypto.randomUUID()}`);
 	await mkdir(fake);
-	await Bun.write(join(fake, "package.json"), JSON.stringify({ name: "sightread", version: "0.8.0" }));
+	await Bun.write(join(fake, "package.json"), JSON.stringify({ name: "@2mangoes/sightread", version: "0.8.0" }));
 	await Bun.write(join(fake, "index.ts"), "");
 	const direct = {
 		openGraph: async () => {
@@ -444,7 +456,7 @@ test("resolver uses matching PATH sightread after an outdated import", async () 
 	};
 	try {
 		const found = await resolveSightread({
-			importer: async (specifier) => (specifier === "sightread" ? direct : matching),
+			importer: async (specifier) => (specifier === "@2mangoes/sightread" ? direct : matching),
 			importedEntry: join(fake, "index.ts"),
 			executable: join(bin, "sightread"),
 			cache: false,
@@ -462,13 +474,13 @@ test("a mismatched global sightread version fails through the graph proxy", asyn
 	await mkdir(join(fake, "bin"), { recursive: true });
 	await Bun.write(
 		join(fake, "package.json"),
-		JSON.stringify({ name: "sightread", version: "0.8.0", exports: { ".": "./index.ts" } }),
+		JSON.stringify({ name: "@2mangoes/sightread", version: "0.8.0", exports: { ".": "./index.ts" } }),
 	);
 	await Bun.write(join(fake, "bin/sightread"), "");
 	const locate = (strictVersion = false) =>
 		resolveSightread({ importer, executable: join(fake, "bin/sightread"), cache: false, strictVersion });
 	const { version } = (await Bun.file(join(import.meta.dir, "../package.json")).json()) as { version: string };
-	const message = `graph needs sightread ${version} (found 0.8.0); npm i -g sightread@${version}`;
+	const message = `graph needs sightread ${version} (found 0.8.0); npm i -g @2mangoes/sightread@${version}`;
 	expect(await locate()).toBeUndefined();
 	await expect(locate(true)).rejects.toThrow(message);
 	const proxy = await openGraphProxy(directory, root, root, { resolve: () => locate(true) });

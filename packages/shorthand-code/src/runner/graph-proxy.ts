@@ -43,7 +43,7 @@ async function packageFromPath(path: string): Promise<{ directory: string; manif
 	for (;;) {
 		try {
 			const manifest = JSON.parse(await readFile(join(directory, "package.json"), "utf8")) as SightreadManifest;
-			if (manifest.name === "sightread") return { directory, manifest };
+			if (manifest.name === "@2mangoes/sightread") return { directory, manifest };
 		} catch {
 			// Keep looking for the package that owns the executable or entry point.
 		}
@@ -81,7 +81,7 @@ export async function sightreadAvailable(executable = findExecutable("sightread"
 	const expected = await expectedVersion();
 	const candidates: string[] = [];
 	try {
-		candidates.push(createRequire(import.meta.url).resolve("sightread/package.json"));
+		candidates.push(createRequire(import.meta.url).resolve("@2mangoes/sightread/package.json"));
 	} catch {
 		// Not in this package's dependency tree; a global install may still be on PATH.
 	}
@@ -102,14 +102,16 @@ export function resolveSightread(options: ResolveOptions = {}) {
 		let mismatch: string | undefined;
 		let direct: GraphLibrary | undefined;
 		try {
-			direct = library(await importer("sightread"));
+			direct = library(await importer("@2mangoes/sightread"));
 		} catch {
 			// A global CLI can be outside this package's dependency tree.
 		}
 		if (direct) {
 			let found: Awaited<ReturnType<typeof packageFromPath>> = undefined;
 			try {
-				found = await packageFromPath(options.importedEntry ?? fileURLToPath(import.meta.resolve("sightread")));
+				found = await packageFromPath(
+					options.importedEntry ?? fileURLToPath(import.meta.resolve("@2mangoes/sightread")),
+				);
 			} catch {
 				// Try the executable if the imported package has no readable manifest.
 			}
@@ -135,14 +137,16 @@ export function resolveSightread(options: ResolveOptions = {}) {
 			}
 		}
 		if (mismatch !== undefined && options.strictVersion)
-			throw new Error(`graph needs sightread ${expected} (found ${mismatch}); npm i -g sightread@${expected}`);
+			throw new Error(
+				`graph needs sightread ${expected} (found ${mismatch}); npm i -g @2mangoes/sightread@${expected}`,
+			);
 		return undefined;
 	};
 	return options.cache === false || options.strictVersion ? find() : (cached ??= find());
 }
 
 export const GRAPH_INSTALL_MESSAGE =
-	"graph needs the sightread package; install it alongside shorthand-code (npm i -g sightread)";
+	"graph needs the sightread package; install it alongside shorthand-code (npm i -g @2mangoes/sightread)";
 const GRAPH_DISABLED_MESSAGE = "graph.query isn't available in this session.";
 
 async function sourceHashes(value: unknown, repo: string): Promise<Record<string, string>> {

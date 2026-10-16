@@ -1,5 +1,5 @@
 {
-	"name": "shorthand-code",
+	"name": "@2mangoes/shorthand-code",
 	"version": "0.14.0",
 	"description": "Edit repositories with Bun programs, with first-class support for TypeScript and JavaScript: a CLI and a library that Pi's shorthand tool is built on.",
 	"keywords": [
@@ -9,13 +9,13 @@
 		"codemod",
 		"overlay"
 	],
-	"homepage": "https://github.com/sebinsua/shortsight/tree/main/packages/shorthand-code#readme",
-	"bugs": "https://github.com/sebinsua/shortsight/issues",
+	"homepage": "https://github.com/2mangoes/shortsight/tree/main/packages/shorthand-code#readme",
+	"bugs": "https://github.com/2mangoes/shortsight/issues",
 	"license": "MIT",
 	"author": "Seb Insua",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/sebinsua/shortsight.git",
+		"url": "git+https://github.com/2mangoes/shortsight.git",
 		"directory": "packages/shorthand-code"
 	},
 	"bin": {
@@ -31,6 +31,9 @@
 		".": "./src/index.ts",
 		"./package.json": "./package.json"
 	},
+	"publishConfig": {
+		"registry": "https://npm.pkg.github.com"
+	},
 	"dependencies": {
 		"@ast-grep/cli": "^0.45.3",
 		"@ast-grep/napi": "^0.45.3",
@@ -39,10 +42,10 @@
 		"vscode-jsonrpc": "^9.0.2"
 	},
 	"peerDependencies": {
-		"sightread": "0.14.0"
+		"@2mangoes/sightread": "0.14.0"
 	},
 	"peerDependenciesMeta": {
-		"sightread": {
+		"@2mangoes/sightread": {
 			"optional": true
 		}
 	},

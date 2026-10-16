@@ -1,5 +1,5 @@
 {
-	"name": "sightread",
+	"name": "@2mangoes/sightread",
 	"version": "0.14.0",
 	"description": "Query a TypeScript project's compiler-resolved code graph from the shell: symbols, edges and exact line ranges for coding agents.",
 	"keywords": [
@@ -7,13 +7,13 @@
 		"ttsc",
 		"typescript"
 	],
-	"homepage": "https://github.com/sebinsua/shortsight/tree/main/packages/sightread#readme",
-	"bugs": "https://github.com/sebinsua/shortsight/issues",
+	"homepage": "https://github.com/2mangoes/shortsight/tree/main/packages/sightread#readme",
+	"bugs": "https://github.com/2mangoes/shortsight/issues",
 	"license": "MIT",
 	"author": "Seb Insua",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/sebinsua/shortsight.git",
+		"url": "git+https://github.com/2mangoes/shortsight.git",
 		"directory": "packages/sightread"
 	},
 	"bin": {
@@ -28,6 +28,9 @@
 	"exports": {
 		".": "./src/index.ts",
 		"./package.json": "./package.json"
+	},
+	"publishConfig": {
+		"registry": "https://npm.pkg.github.com"
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "1.31.0",

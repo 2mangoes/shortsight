@@ -1,16 +1,20 @@
 # sightread
 
-![What a change to getMimeType affects in hono](https://raw.githubusercontent.com/sebinsua/shortsight/main/docs/sightread.png)
+![What a change to getMimeType affects in hono](https://raw.githubusercontent.com/2mangoes/shortsight/main/docs/sightread.png)
 
 `sightread` shows how a TypeScript codebase fits together: what calls what, and the exact lines each piece of code spans. A coding agent can get its bearings with one command, then read only the lines it needs instead of whole files.
 
 ## Install
 
+This fork uses GitHub Packages. Complete the [registry authentication setup](https://github.com/2mangoes/shortsight#github-packages-authentication) first, even for public packages.
+
 Install [Bun](https://bun.sh) 1.4 or later, then `sightread`:
 
 ```sh
-npm i -g sightread
+npm i -g @2mangoes/sightread
 ```
+
+For installation from a local checkout instead of npm, see the [local checkout guide](../../README.md#local-checkout-installation).
 
 ## Use
 

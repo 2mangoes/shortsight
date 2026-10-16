@@ -19,7 +19,7 @@ import {
 	runWithBun,
 	sightreadAvailable,
 	textForModel,
-} from "shorthand-code";
+} from "@2mangoes/shorthand-code";
 import { callLine, resultLines, unstructuredResultText } from "./display.ts";
 
 const DESCRIPTION = `Edit repository files with a TypeScript program run by Bun. Best for changes across many files, repeated edits and semantic TypeScript renames or moves; a small change to one file is quicker as a direct edit. Top-level await and ordinary Bun/Node APIs work. Use repository-relative paths. Only edits files inside a git repository; use edit or write for anything else. Set cwd to a checkout path when Pi's working directory is outside the repository, such as a child worktree in a bare worktree container. The program runs in an isolated workspace; changes apply on successful exit by default and the tool reports the diff. Tests, type-checks and builds belong outside the program: in a shell call, or, when a codemode script calls shorthand, later in that script.
@@ -42,7 +42,7 @@ const GRAPH_DESCRIPTION =
 	"- await graph.query(request | request[]) queries symbols and relationships; graph results can be passed to sg as scope. The graph shows the repository before this program's edits.\n";
 
 export const SKILLS_DIRECTORY = path.join(
-	path.dirname(createRequire(import.meta.url).resolve("shorthand-code/package.json")),
+	path.dirname(createRequire(import.meta.url).resolve("@2mangoes/shorthand-code/package.json")),
 	"skills",
 );
 

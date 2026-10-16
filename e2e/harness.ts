@@ -286,7 +286,10 @@ async function isSightreadDependency(entry: string): Promise<boolean> {
 	if (!(await lstat(directory)).isDirectory()) directory = path.dirname(directory);
 	for (; directory !== path.dirname(directory); directory = path.dirname(directory)) {
 		const manifest = await readFile(path.join(directory, "package.json"), "utf8").catch(() => null);
-		if (manifest) return (JSON.parse(manifest) as { name?: string }).name === "sightread";
+		if (manifest) {
+			const { name } = JSON.parse(manifest) as { name?: string };
+			return name === "sightread" || name === "@2mangoes/sightread";
+		}
 	}
 	return false;
 }

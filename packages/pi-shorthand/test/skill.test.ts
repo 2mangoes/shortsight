@@ -22,9 +22,12 @@ test("Pi loads the shorthand skill from shorthand-code", async () => {
 
 test("Node resolves shorthand-code's package.json, as Pi does when loading the extension", () => {
 	// Bun ignores a package's `exports` map here, and Node doesn't, so check under Node.
-	const result = Bun.spawnSync(["node", "-e", 'console.log(require.resolve("shorthand-code/package.json"))'], {
-		cwd: path.join(import.meta.dir, ".."),
-	});
+	const result = Bun.spawnSync(
+		["node", "-e", 'console.log(require.resolve("@2mangoes/shorthand-code/package.json"))'],
+		{
+			cwd: path.join(import.meta.dir, ".."),
+		},
+	);
 	expect(result.stderr.toString()).toBe("");
 	expect(result.stdout.toString().trim().endsWith(path.join("shorthand-code", "package.json"))).toBe(true);
 });

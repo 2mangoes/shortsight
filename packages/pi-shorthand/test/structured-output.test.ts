@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { RunResult } from "shorthand-code";
+import type { RunResult } from "@2mangoes/shorthand-code";
 import { Value } from "typebox/value";
 import registerShorthand, { SHORTHAND_OUTPUT_SCHEMA, shorthandOutput } from "../src/index.ts";
 

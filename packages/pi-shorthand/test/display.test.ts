@@ -5,7 +5,7 @@ import { highlightCode, initTheme, type Theme } from "@earendil-works/pi-coding-
 import { callLine, resultLines, unstructuredResultText } from "../src/display.ts";
 import { Text } from "@earendil-works/pi-tui";
 import { FitsScreen, renderShorthandResult } from "../src/index.ts";
-import { textForModel, type FileChange, type RunResult } from "shorthand-code";
+import { textForModel, type FileChange, type RunResult } from "@2mangoes/shorthand-code";
 
 // Plain text: no colours, so the tests read the words and layout.
 const theme = {

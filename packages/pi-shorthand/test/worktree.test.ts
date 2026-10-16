@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { $ } from "bun";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import registerShorthand from "../src/index.ts";
-import type { RunResult } from "shorthand-code";
+import type { RunResult } from "@2mangoes/shorthand-code";
 
 const hasOverlay =
 	process.platform === "darwin"

@@ -1,10 +1,12 @@
 # pi-shorthand
 
-![A shorthand call in Pi](https://raw.githubusercontent.com/sebinsua/shortsight/main/docs/shorthand.png)
+![A shorthand call in Pi](https://raw.githubusercontent.com/2mangoes/shortsight/main/docs/shorthand.png)
 
 A [Pi](https://github.com/earendil-works/pi) tool for editing repositories with Bun programs, with first-class support for TypeScript and JavaScript.
 
 ## Install
+
+This fork uses GitHub Packages. Complete the [registry authentication setup](https://github.com/2mangoes/shortsight#github-packages-authentication) first, even for public packages.
 
 Install [Bun](https://bun.sh) 1.4 or later, which runs the programs:
 
@@ -15,7 +17,7 @@ curl -fsSL https://bun.sh/install | bash
 Then install pi-shorthand:
 
 ```sh
-pi install npm:pi-shorthand
+pi install npm:@2mangoes/pi-shorthand
 ```
 
 On macOS, install clang and AgentFS:
@@ -32,6 +34,8 @@ apt-cache policy bubblewrap
 sudo apt install bubblewrap build-essential lsof
 ```
 
+For installation from a local checkout instead of npm, see the [local checkout guide](../../README.md#local-checkout-installation).
+
 ## Technical choices
 
 pi-shorthand gives Pi a programming environment instead of a patch format. This makes multi-file and structural edits possible in one call, but does not guarantee that Pi will find it easier or more reliable than its built-in edit tool. Which works better depends on the model and the task.
@@ -44,12 +48,12 @@ Scripts run by Pi's `codemode` tool can call `shorthand` too. They get back what
 
 ## Without Pi
 
-The engine is published separately as [shorthand-code](https://github.com/sebinsua/shortsight/tree/main/packages/shorthand-code), with a `shorthand` command that runs a program from a file or stdin and prints the same result. See `shorthand --help`.
+The engine is published separately as [shorthand-code](https://github.com/2mangoes/shortsight/tree/main/packages/shorthand-code), with a `shorthand` command that runs a program from a file or stdin and prints the same result. See `shorthand --help`.
 
 ## Code graph (optional)
 
-Install [`sightread`](https://github.com/sebinsua/shortsight/tree/main/packages/sightread) and programs can also ask the TypeScript compiler what calls what, with exact line ranges, before they edit:
+Install [`sightread`](https://github.com/2mangoes/shortsight/tree/main/packages/sightread) and programs can also ask the TypeScript compiler what calls what, with exact line ranges, before they edit:
 
 ```sh
-npm i -g sightread
+npm i -g @2mangoes/sightread
 ```

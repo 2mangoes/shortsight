@@ -325,57 +325,63 @@ test("a frozen extension remaps workspace bins and rejects nested links into liv
 	expect(await command.exited).toBe(0);
 });
 
-test("sightread-off frozen extension cannot resolve sightread while sightread-on can", async () => {
-	const root = await mkdtemp(path.join(tmpdir(), "pi-shorthand-freeze-sightread-"));
-	temporary.push(root);
-	const source = path.join(root, "source");
-	await mkdir(path.join(source, "packages/sightread"), { recursive: true });
-	await mkdir(path.join(source, "node_modules/.bin"), { recursive: true });
-	await Bun.write(path.join(source, ".gitignore"), "node_modules\n");
-	await Bun.write(
-		path.join(source, "packages/sightread/package.json"),
-		'{"name":"sightread","exports":"./index.js"}\n',
-	);
-	await Bun.write(path.join(source, "packages/sightread/index.js"), "export const available = true;\n");
-	await Bun.write(path.join(source, "packages/sightread/cli.js"), "console.log('sightread');\n");
-	await symlink("../packages/sightread", path.join(source, "node_modules/sightread"));
-	await symlink("../packages/sightread", path.join(source, "node_modules/alias"));
-	await symlink("../sightread/cli.js", path.join(source, "node_modules/.bin/sightread"));
-	await symlink("../alias/cli.js", path.join(source, "node_modules/.bin/alias"));
-	await $`git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm base`.cwd(source);
-	const on = await freezeExtension(source, path.join(root, "on"), "candidate");
-	const off = await freezeExtension(source, path.join(root, "off"), "candidate", "off");
-	for (const [frozen, available] of [
-		[on, true],
-		[off, false],
-	] as const) {
-		const probe = path.join(frozen.path, "probe.ts");
+test.each(["sightread", "@2mangoes/sightread"])(
+	"sightread-off filters %s while sightread-on can resolve it",
+	async (packageName) => {
+		const root = await mkdtemp(path.join(tmpdir(), "pi-shorthand-freeze-sightread-"));
+		temporary.push(root);
+		const source = path.join(root, "source");
+		await mkdir(path.join(source, "packages/sightread"), { recursive: true });
+		await mkdir(path.join(source, "node_modules/.bin"), { recursive: true });
+		await mkdir(path.join(source, "node_modules/@2mangoes"), { recursive: true });
+		await Bun.write(path.join(source, ".gitignore"), "node_modules\n");
 		await Bun.write(
-			probe,
-			`const require = (await import("node:module")).createRequire(import.meta.url);
-for (const name of ["sightread", "alias"]) {
+			path.join(source, "packages/sightread/package.json"),
+			JSON.stringify({ name: packageName, exports: "./index.js" }),
+		);
+		await Bun.write(path.join(source, "packages/sightread/index.js"), "export const available = true;\n");
+		await Bun.write(path.join(source, "packages/sightread/cli.js"), "console.log('sightread');\n");
+		await symlink("../../packages/sightread", path.join(source, "node_modules/@2mangoes/sightread"));
+		await symlink("../packages/sightread", path.join(source, "node_modules/alias"));
+		await symlink("../@2mangoes/sightread/cli.js", path.join(source, "node_modules/.bin/sightread"));
+		await symlink("../alias/cli.js", path.join(source, "node_modules/.bin/alias"));
+		await $`git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm base`.cwd(source);
+		const on = await freezeExtension(source, path.join(root, "on"), "candidate");
+		const off = await freezeExtension(source, path.join(root, "off"), "candidate", "off");
+		for (const [frozen, available] of [
+			[on, true],
+			[off, false],
+		] as const) {
+			const probe = path.join(frozen.path, "probe.ts");
+			await Bun.write(
+				probe,
+				`const require = (await import("node:module")).createRequire(import.meta.url);
+for (const name of ["@2mangoes/sightread", "alias"]) {
   try { require.resolve(name); console.log(name + ":require:yes"); }
   catch { console.log(name + ":require:no"); }
   try { await import(name); console.log(name + ":import:yes"); }
   catch { console.log(name + ":import:no"); }
 }\n`,
-		);
-		const child = Bun.spawn(["bun", probe], { cwd: frozen.path, stdout: "pipe", stderr: "pipe" });
-		const [exit, stdout, stderr] = await Promise.all([
-			child.exited,
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-		]);
-		expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" });
-		for (const name of ["sightread", "alias"]) {
-			expect(stdout).toContain(`${name}:require:${available ? "yes" : "no"}`);
-			expect(stdout).toContain(`${name}:import:${available ? "yes" : "no"}`);
+			);
+			const child = Bun.spawn(["bun", probe], { cwd: frozen.path, stdout: "pipe", stderr: "pipe" });
+			const [exit, stdout, stderr] = await Promise.all([
+				child.exited,
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
+			expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" });
+			for (const name of ["@2mangoes/sightread", "alias"]) {
+				expect(stdout).toContain(`${name}:require:${available ? "yes" : "no"}`);
+				expect(stdout).toContain(`${name}:import:${available ? "yes" : "no"}`);
+			}
+			for (const name of ["sightread", "alias"]) {
+				expect(Boolean(await lstat(path.join(frozen.path, "node_modules/.bin", name)).catch(() => null))).toBe(
+					available,
+				);
+			}
 		}
-		for (const name of ["sightread", "alias"]) {
-			expect(Boolean(await lstat(path.join(frozen.path, "node_modules/.bin", name)).catch(() => null))).toBe(available);
-		}
-	}
-});
+	},
+);
 
 test("a nested scoped dependency link into the source workspace is rejected", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pi-shorthand-freeze-scoped-"));

@@ -17,7 +17,7 @@ import {
 	timeoutBudgetMs,
 	timeoutText,
 	timingBreakdown,
-} from "shorthand-code";
+} from "@2mangoes/shorthand-code";
 
 type ToolBackground = "toolSuccessBg" | "toolErrorBg";
 
