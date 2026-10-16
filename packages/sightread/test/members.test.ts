@@ -231,7 +231,7 @@ test("a reverse trace from a member starts from its references; other traces say
 		direction: "reverse",
 	});
 	expect(result.nodes.map(({ name }) => name)).toEqual(["Lit.lprop", "readsAll", "element", "written.lprop"]);
-	expect(result.note).toStartWith("complete: Lit.lprop has no graph node");
+	expect(result.note).toBe("Lit.lprop has no graph node, so its direct users come from its references");
 	expect(run(JSON.stringify({ type: "trace", from: "Lit.lprop" })).err).toBe(
 		"sightread: trace can only go reverse from Lit.lprop: the graph has no node for it, as it's a member of Lit; trace reverse from it for what uses it, or ask references",
 	);

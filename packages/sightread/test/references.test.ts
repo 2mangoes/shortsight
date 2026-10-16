@@ -393,7 +393,7 @@ for (const [name, contents] of Object.entries(wideFiles)) {
 	writeFileSync(join(wide, name), contents);
 }
 
-test("a reverse trace past the graph's limit follows graph callers after its hub", () => {
+test("a reverse trace past 32 symbols follows every caller from its hub, in one graph request", () => {
 	const output = runIn(
 		wide,
 		"--json",
@@ -409,8 +409,7 @@ test("a reverse trace past the graph's limit follows graph callers after its hub
 	}>;
 	const names = new Set(result.nodes.map(({ name }) => name));
 	expect(result.raise).toBeUndefined();
-	expect(result.note).toContain("complete");
-	// Calls from references complete the 40-caller hub; graph traces follow each later level.
+	expect(result.note).toBeUndefined();
 	expect(result.shown).toBeGreaterThanOrEqual(83);
 	for (let index = 0; index < 40; index++)
 		for (const name of [`direct${index}`, `outer${index}`]) expect(names.has(name)).toBe(true);
@@ -436,9 +435,7 @@ test("a reverse trace past the graph's limit follows graph callers after its hub
 	expect(text).toContain(
 		"  5-5  Child.run               method             calls Base.run :5; overrides Base.run :5\n",
 	);
-	expect(text).toEndWith(
-		"note: complete: past the graph's 32-symbol limit, callers were followed through graph traces",
-	);
+	expect(text).not.toContain("note:");
 });
 
 test("a reverse trace from a hub shows its direct users unless asked to go deeper", () => {
@@ -451,11 +448,11 @@ test("a reverse trace from a hub shows its direct users unless asked to go deepe
 		expect(names.has(`outer${index}`)).toBe(false);
 	}
 	expect(result.note).toBe(
-		"complete: past the graph's 32-symbol limit, callers were followed through graph traces; only direct users are shown, since there are more than 32; pass maxDepth to follow their users too",
+		"only direct users are shown, since there are more than 32; pass maxDepth to follow their users too",
 	);
 });
 
-test("a hub's references fallback keeps every use of a class, as the graph's trace does", () => {
+test("a reverse trace from a class keeps every use of it, typed ones included", () => {
 	const fixture = createFixtureProject({
 		"src/Widget.ts": "export class Widget {}\n",
 		"src/uses.ts": [
@@ -475,7 +472,7 @@ test("a hub's references fallback keeps every use of a class, as the graph's tra
 		const widget = trace("src/Widget.ts#Widget:class");
 		expect(widget.shown).toBe(80);
 		expect(widget.nodes.map(({ name }) => name)).toEqual(expect.arrayContaining(["create0", "typed0"]));
-		expect(widget.edges.map(({ kind }) => kind)).toEqual(expect.arrayContaining(["instantiates", "references"]));
+		expect(widget.edges.map(({ kind }) => kind)).toEqual(expect.arrayContaining(["instantiates", "type_ref"]));
 	} finally {
 		runIn(fixture.root, "stop");
 		fixture.cleanup();

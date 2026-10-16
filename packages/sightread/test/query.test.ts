@@ -1,5 +1,7 @@
 // Check batch ordering, empty results, and output modes.
 import { expect, test } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { runQuery } from "../src/query.ts";
 import type { RangeIndex } from "../src/ranges.ts";
 import type { ReferenceIndex } from "../src/references.ts";
@@ -54,265 +56,262 @@ test("unchanged input is byte deterministic", async () => {
 	expect(await runQuery({ client, ranges }, requests, { mode: "text" })).toBe(first);
 });
 
-test("complete reverse trace follows graph handles, edges, and cycles", async () => {
+// A graph that walks callers as the real one does: breadth first, to a depth, within a symbol and hop budget.
+function callerGraph(callers: Record<string, Array<{ id: string; kind?: string }>>) {
+	const sent: Record<string, unknown>[] = [];
+	const graph: GraphClient = {
+		...client,
+		query: async (request) => {
+			sent.push(request);
+			const from = String(request.from);
+			const maxDepth = typeof request.maxDepth === "number" ? request.maxDepth : 3;
+			const maxNodes = typeof request.maxNodes === "number" ? request.maxNodes : 12;
+			const reached = new Map<string, Record<string, unknown>>();
+			const hops: Record<string, unknown>[] = [];
+			let truncated = false;
+			for (let level = 0, frontier = [from]; frontier.length; level++) {
+				const next: string[] = [];
+				for (const target of frontier) {
+					const users = callers[target] ?? [];
+					if (level >= maxDepth) {
+						if (users.length) truncated = true;
+						continue;
+					}
+					for (const { id, kind } of users) {
+						const hop = { from: id, to: target, kind: kind ?? "calls", depth: level + 1 };
+						if (id === from || reached.has(id)) {
+							if (hops.length >= maxNodes * 2) truncated = true;
+							else hops.push(hop);
+							continue;
+						}
+						if (reached.size >= maxNodes || hops.length >= maxNodes * 2) {
+							truncated = true;
+							continue;
+						}
+						reached.set(id, { ...symbol(id), kind: id.split(":")[1], depth: level + 1 });
+						hops.push(hop);
+						next.push(id);
+					}
+				}
+				frontier = next;
+			}
+			return {
+				value: {
+					result: {
+						type: "trace",
+						start: { ...symbol(from), kind: from.split(":")[1] },
+						direction: request.direction,
+						reached: [...reached.values()],
+						hops,
+						truncated,
+					},
+				},
+				isError: false,
+			};
+		},
+	};
+	return { graph, sent };
+}
+
+type TraceModel = {
+	shown: number;
+	raise?: string;
+	note?: string;
+	nodes: Array<{ handle: string; name: string }>;
+	edges: Array<{ from: string; to: string; kind: string }>;
+};
+
+const traceWith = async (context: Parameters<typeof runQuery>[0], request: Record<string, unknown>) =>
+	(
+		JSON.parse(
+			await runQuery(context, [{ type: "trace", direction: "reverse", ...request }], { mode: "json" }),
+		) as TraceModel[]
+	)[0]!;
+
+test("a reverse trace is one graph request with sightread's budget, and keeps cycles and dispatch edges", async () => {
 	const target = "src/a.ts#target:function";
 	const nested = "src/a.ts#createRouterInner.step:function";
 	const override = "src/a.ts#Child.run:method";
-	const seen: string[] = [];
-	const traceClient: GraphClient = {
-		...client,
-		query: async (request) => {
-			const from = String(request.from);
-			if (request.maxDepth !== 1)
-				return {
-					value: {
-						result: {
-							type: "trace",
-							start: { id: target, name: "target", file: "src/a.ts", kind: "function" },
-							reached: [],
-							truncated: true,
-						},
-					},
-					isError: false,
-				};
-			seen.push(from);
-			const callers = from === target ? [nested, override] : from === nested ? [target] : [];
-			return {
-				value: {
-					result: {
-						type: "trace",
-						start: { id: from, name: from.split("#")[1].split(":")[0], file: "src/a.ts", kind: from.split(":")[1] },
-						reached: callers.map((id) => ({
-							id,
-							name: id.split("#")[1].split(":")[0],
-							file: "src/a.ts",
-							kind: id.split(":")[1],
-						})),
-						hops: callers.map((caller) => ({
-							from: caller,
-							to: from,
-							kind: caller === override ? "overrides" : "calls",
-							evidence: { file: "src/a.ts", startLine: 2, startCol: 1, endLine: 2, endCol: 5 },
-						})),
-						truncated: false,
-					},
-				},
-				isError: false,
-			};
-		},
-	};
-	const [result] = JSON.parse(
-		await runQuery(
-			{ client: traceClient, ranges, root: "/tmp" },
-			[{ type: "trace", from: target, direction: "reverse" }],
-			{ mode: "json" },
-		),
-	) as Array<{
-		shown: number;
-		raise?: string;
-		note?: string;
-		nodes: Array<{ handle: string }>;
-		edges: Array<{ from: string; to: string; kind: string }>;
-	}>;
+	const { graph, sent } = callerGraph({
+		[target]: [{ id: nested }, { id: override, kind: "overrides" }],
+		[nested]: [{ id: target }],
+	});
+	const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target });
+	expect(sent).toEqual([{ type: "trace", from: target, direction: "reverse", maxNodes: 1000, maxDepth: 3 }]);
 	expect(result.raise).toBeUndefined();
+	expect(result.note).toBeUndefined();
 	expect(result.shown).toBe(2);
-	expect(result.nodes.map((node) => node.handle)).toContain(nested);
-	expect(result.nodes.map((node) => node.handle)).toContain(override);
-	expect(result.edges.map((edge) => [edge.from, edge.to, edge.kind])).toContainEqual([nested, target, "calls"]);
-	expect(result.edges.map((edge) => [edge.from, edge.to, edge.kind])).toContainEqual([override, target, "overrides"]);
-	expect(result.edges.map((edge) => [edge.from, edge.to, edge.kind])).toContainEqual([target, nested, "calls"]);
-	expect(seen).toEqual([target, nested, override]);
-	expect(result.note).toContain("complete");
+	expect(result.edges.map((edge) => [edge.from, edge.to, edge.kind])).toEqual(
+		expect.arrayContaining([
+			[nested, target, "calls"],
+			[override, target, "overrides"],
+			[target, nested, "calls"],
+		]),
+	);
+	// Raw output stays the graph's own answer to the request as given.
+	sent.length = 0;
+	await runQuery({ client: graph, ranges, root: "/tmp" }, [{ type: "trace", from: target, direction: "reverse" }], {
+		mode: "raw",
+	});
+	expect(sent).toEqual([{ type: "trace", from: target, direction: "reverse" }]);
 });
 
-test("details answers nested functions in a completed trace, and methods still get their own trace", async () => {
+test("reverse trace honors maxNodes and maxDepth, and says which bound cut it", async () => {
 	const target = "src/a.ts#target:function";
-	const nested = "src/a.ts#outer.inner:function";
-	const method = "src/a.ts#Box.open:method";
-	const outer = "src/a.ts#outer:function";
-	const traced: string[] = [];
-	const detailed: string[][] = [];
-	const traceClient: GraphClient = {
-		...client,
-		query: async (request) => {
-			if (request.type === "details") {
-				const handles = request.handles as string[];
-				detailed.push(handles);
-				return {
-					value: {
-						result: {
-							type: "details",
-							nodes: handles.map((id) => ({
-								...symbol(id),
-								dependedOnBy: id === nested ? [{ ...symbol(outer), relation: "calls" }] : [],
-							})),
-						},
-					},
-					isError: false,
-				};
-			}
-			const from = String(request.from);
-			if (request.maxDepth !== 1)
-				return {
-					value: { result: { type: "trace", start: symbol(target), reached: [], truncated: true } },
-					isError: false,
-				};
-			traced.push(from);
-			const callers = from === target ? [nested, method] : [];
-			return {
-				value: {
-					result: {
-						type: "trace",
-						reached: callers.map((id) => ({ ...symbol(id), kind: id.split(":")[1] })),
-						hops: callers.map((caller) => ({ from: caller, to: from, kind: "calls" })),
-						truncated: false,
-					},
-				},
-				isError: false,
-			};
-		},
-	};
-	const [result] = JSON.parse(
-		await runQuery(
-			{ client: traceClient, ranges, root: "/tmp" },
-			[{ type: "trace", from: target, direction: "reverse", maxDepth: 2 }],
-			{ mode: "json" },
-		),
-	) as Array<{ nodes: Array<{ handle: string }> }>;
-	expect(detailed).toEqual([[nested]]);
-	expect(traced).toEqual([target, method]);
-	expect(result.nodes.map(({ handle }) => handle)).toContain(outer);
+	// A chain of forty callers, and forty leaves besides it on the target, so it's a hub.
+	const chain = Array.from({ length: 40 }, (_, index) => callerHandle(index));
+	const { graph } = callerGraph({
+		[target]: [
+			{ id: chain[0]! },
+			...Array.from({ length: 40 }, (_, leaf) => ({ id: `src/a.ts#leaf${leaf}:function` })),
+		],
+		...Object.fromEntries(chain.slice(0, -1).map((id, index) => [id, [{ id: chain[index + 1]! }]])),
+	});
+	const context = { client: graph, ranges, root: "/tmp" };
+	const ask = (maxNodes?: number, maxDepth?: number) =>
+		traceWith(context, {
+			from: target,
+			...(maxNodes === undefined ? {} : { maxNodes }),
+			...(maxDepth === undefined ? {} : { maxDepth }),
+		});
+	const eight = await ask(8);
+	expect([eight.shown, eight.raise]).toEqual([8, "trace.maxNodes"]);
+	const many = await ask(35);
+	expect([many.shown, many.raise]).toEqual([35, "trace.maxNodes"]);
+	expect(many.note).toBe(
+		"stopped at 35 symbols; trace from a narrower symbol; only direct users are shown, since there are more than 32; pass maxDepth to follow their users too",
+	);
+	// A depth asked for ends the walk without truncating it.
+	const one = await ask(undefined, 1);
+	expect([one.shown, one.raise, one.note]).toEqual([41, undefined, undefined]);
+	expect((await ask(undefined, 2)).shown).toBe(42);
+	// With more direct users than 32, the default is one level; asked, never more than eight.
+	const hub = await ask();
+	expect([hub.shown, hub.raise]).toEqual([41, "trace.maxDepth"]);
+	expect(hub.note).toBe(
+		"only direct users are shown, since there are more than 32; pass maxDepth to follow their users too",
+	);
+	expect((await ask(undefined, 3)).shown).toBe(43);
+	expect((await ask(undefined, 20)).shown).toBe(48);
 });
 
-test("reverse trace honors maxNodes, maxDepth, and counts unresolved symbols", async () => {
+test("a hub past the symbol limit says the limit stopped it", async () => {
 	const target = "src/a.ts#target:function";
-	const missing = "src/a.ts#missing:function";
-	const calls: string[] = [];
-	const traceClient: GraphClient = {
-		...client,
-		query: async (request) => {
-			if (request.maxDepth !== 1)
-				return {
-					value: {
-						result: {
-							type: "trace",
-							start: { id: target, name: "target", file: "src/a.ts", kind: "function" },
-							reached: [],
-							truncated: true,
-						},
-					},
-					isError: false,
-				};
-			const from = String(request.from);
-			calls.push(from);
-			if (from === missing) throw new Error("symbol not found");
-			if (from.includes("#leaf"))
-				return { value: { result: { type: "trace", reached: [], hops: [] } }, isError: false };
-			const index = from === target ? -1 : Number(/caller(\d+)/.exec(from)?.[1]);
-			const next = index < 39 ? [callerHandle(index + 1)] : [];
-			// The target is a hub: forty leaf callers besides the chain, so the node limit can be reached.
-			if (from === target)
-				next.push(missing, ...Array.from({ length: 40 }, (_, leaf) => `src/a.ts#leaf${leaf}:function`));
-			return {
-				value: {
-					result: {
-						type: "trace",
-						start: { id: from, name: from.split("#")[1].split(":")[0], file: "src/a.ts", kind: "function" },
-						reached: next.map((id) => ({
-							id,
-							name: id.split("#")[1].split(":")[0],
-							file: "src/a.ts",
-							kind: "function",
-						})),
-						hops: next.map((caller) => ({ from: caller, to: from, kind: "calls" })),
-						truncated: false,
-					},
-				},
-				isError: false,
-			};
-		},
-	};
-	const references: ReferenceIndex = {
-		query: async () => {
-			throw new Error("unexpected references query");
-		},
-		reexport: async () => undefined,
-		close: async () => {},
-	};
-	const context = { client: traceClient, ranges, references, root: "/tmp" };
-	const ask = async (maxNodes?: number, maxDepth?: number) =>
-		(
-			JSON.parse(
-				await runQuery(
-					context,
-					[
-						{
-							type: "trace",
-							from: target,
-							direction: "reverse",
-							...(maxNodes === undefined ? {} : { maxNodes }),
-							...(maxDepth === undefined ? {} : { maxDepth }),
-						},
-					],
-					{ mode: "json" },
-				),
-			) as Array<{ shown: number; note?: string; raise?: string }>
-		)[0];
-	expect((await ask(8)).raise).toBe("trace.maxNodes");
-	expect((await ask(32)).raise).toBe("trace.maxNodes");
-	expect(calls).toEqual([]);
-	expect((await ask(35)).shown).toBe(35);
-	expect((await ask(35)).note).toContain("stopped at 35 symbols");
-	// One level: the chain's first caller, the missing symbol and the forty leaves.
-	expect((await ask(undefined, 1)).shown).toBe(42);
-	expect((await ask(undefined, 2)).shown).toBe(43);
-	// With more direct users than the graph's limit, the default is one level; asked, never more than eight.
-	expect((await ask()).shown).toBe(42);
-	expect((await ask()).note).toContain("only direct users are shown");
-	expect((await ask()).raise).toBe("trace.maxDepth");
-	const complete = await ask(undefined, 3);
-	expect(complete.raise).toBeUndefined();
-	expect(complete.shown).toBe(44);
-	expect(complete.note).toContain("1 symbol skipped");
-	expect((await ask(undefined, 20)).shown).toBe(49);
+	const { graph } = callerGraph({
+		[target]: Array.from({ length: 1001 }, (_, index) => ({ id: callerHandle(index) })),
+	});
+	const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target });
+	expect([result.shown, result.raise]).toEqual([1000, "trace.maxNodes"]);
+	expect(result.note).toBe(
+		"stopped at 1000 symbols; trace from a narrower symbol; only direct users are shown, since there are more than 32; pass maxDepth to follow their users too",
+	);
 });
 
-test("a start with exactly the graph's limit of direct users keeps the default depth", async () => {
+test("a start with exactly 32 direct users keeps the default depth", async () => {
 	const target = "src/a.ts#target:function";
 	const direct = Array.from({ length: 32 }, (_, index) => `src/a.ts#direct${index}:function`);
-	const traceClient: GraphClient = {
-		...client,
-		query: async (request) => {
-			const from = String(request.from);
-			if (request.maxDepth !== 1)
-				return {
-					value: { result: { type: "trace", start: symbol(target), reached: [], truncated: true } },
-					isError: false,
-				};
-			// Each direct user has a caller of its own, so the graph flags the one-level trace as truncated.
-			const callers = from === target ? direct : from.includes("#direct") ? [from.replace("direct", "outer")] : [];
-			return {
-				value: {
-					result: {
-						type: "trace",
-						reached: callers.map(symbol),
-						hops: callers.map((caller) => ({ from: caller, to: from, kind: "calls" })),
-						truncated: from === target,
-					},
-				},
-				isError: false,
-			};
-		},
-	};
-	const [result] = JSON.parse(
-		await runQuery(
-			{ client: traceClient, ranges, root: "/tmp" },
-			[{ type: "trace", from: target, direction: "reverse" }],
-			{ mode: "json" },
-		),
-	) as Array<{ nodes: Array<{ name: string }>; note?: string }>;
+	const { graph } = callerGraph({
+		[target]: direct.map((id) => ({ id })),
+		...Object.fromEntries(direct.map((id) => [id, [{ id: id.replace("direct", "outer") }]])),
+	});
+	const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target });
 	expect(result.nodes.map(({ name }) => name)).toContain("outer0");
-	expect(result.note).not.toContain("only direct users");
+	expect(result.note).toBeUndefined();
+	// Asking for exactly as many symbols as there are leaves none out.
+	const exact = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target, maxNodes: 64 });
+	expect([exact.shown, exact.raise, exact.note]).toEqual([64, undefined, undefined]);
+	expect((await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target, maxNodes: 63 })).raise).toBe(
+		"trace.maxNodes",
+	);
+});
+
+test("a forward or path trace names the bound that cut it", async () => {
+	const start = "src/a.ts#start:function";
+	const chain = Array.from({ length: 6 }, (_, index) => callerHandle(index));
+	// Forward along a chain: each symbol "calls" the next, which the fake graph walks the same way.
+	const { graph } = callerGraph({
+		[start]: [{ id: chain[0]! }],
+		...Object.fromEntries(chain.slice(0, -1).map((id, index) => [id, [{ id: chain[index + 1]! }]])),
+	});
+	const context = { client: graph, ranges, root: "/tmp" };
+	const forward = (request: Record<string, unknown>) =>
+		traceWith(context, { from: start, direction: "forward", ...request });
+	expect((await forward({})).raise).toBe("trace.maxDepth");
+	expect((await forward({ maxNodes: 2 })).raise).toBe("trace.maxNodes");
+	expect((await forward({ maxDepth: 10 })).raise).toBeUndefined();
+});
+
+test("a member with no graph node starts from its references, then follows each user's callers together", async () => {
+	const root = mkdtempSync(join(realpathSync("/tmp"), "sr-nodeless-"));
+	writeFileSync(
+		join(root, "a.ts"),
+		"export function first() { return box.prop; }\nexport function second() { box.prop(); }\n",
+	);
+	const start = "a.ts#Box.prop:variable";
+	const first = "a.ts#first:function";
+	const second = "a.ts#second:function";
+	const outer = "a.ts#outer:function";
+	const top = "a.ts#top:function";
+	const nodeless: RangeIndex = {
+		...ranges,
+		declarations: async () => [
+			{ name: "Box.prop", kind: "property", start: 1, end: 1, codeStart: 1, unindexed: "member" },
+		],
+	};
+	const references: ReferenceIndex = {
+		query: async () => ({
+			type: "references",
+			shown: 2,
+			edges: [],
+			sections: {},
+			nodes: [
+				{
+					handle: "a.ts#ref:1",
+					name: "prop",
+					file: "a.ts",
+					ranges: null,
+					line: 1,
+					col: 38,
+					endCol: 42,
+					in: { handle: first },
+				},
+				{
+					handle: "a.ts#ref:2",
+					name: "prop",
+					file: "a.ts",
+					ranges: null,
+					line: 2,
+					col: 31,
+					endCol: 35,
+					text: "export function second() { box.prop(); }",
+					call: { line: 2, col: 27, endLine: 2, endCol: 37, arguments: [] },
+					in: { handle: second },
+				},
+			],
+		}),
+		reexport: async () => undefined,
+		close: async () => {},
+	} as unknown as ReferenceIndex;
+	const { graph, sent } = callerGraph({ [first]: [{ id: outer }], [second]: [{ id: outer }], [outer]: [{ id: top }] });
+	try {
+		const result = await traceWith({ client: graph, ranges: nodeless, references, root }, { from: start, maxDepth: 2 });
+		expect(sent.map(({ from, maxDepth }) => [from, maxDepth])).toEqual([
+			[first, 1],
+			[second, 1],
+		]);
+		expect(result.nodes.map(({ handle }) => handle).toSorted()).toEqual([start, first, outer, second].toSorted());
+		expect(result.edges.map((edge) => [edge.from, edge.to, edge.kind])).toEqual(
+			expect.arrayContaining([
+				[first, start, "accesses"],
+				[second, start, "calls"],
+				[outer, first, "calls"],
+				[outer, second, "calls"],
+			]),
+		);
+		expect(result.note).toBe("Box.prop has no graph node, so its direct users come from its references");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("--in keeps each details neighbour list pointing at its own edges", async () => {

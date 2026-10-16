@@ -187,6 +187,19 @@ function truncated(value: unknown): boolean {
 	return item ? item.truncated === true || Object.values(item).some(truncated) : false;
 }
 
+// The graph marks a trace truncated whether its symbol or hop budget, its depth, or a dispatch fanout it withheld
+// ended the walk, so name the bound that did: a full budget, else the depth if the walk reached it.
+function traceLimit(request: Record<string, unknown>, root: Record<string, unknown>): string {
+	// A path search follows maxDepth alone.
+	if (request.to !== undefined) return "maxDepth";
+	const budget = typeof request.maxNodes === "number" ? Math.max(1, Math.floor(request.maxNodes)) : 12;
+	const reached = Array.isArray(root.reached) ? root.reached : [];
+	const hops = Array.isArray(root.hops) ? root.hops : [];
+	if (reached.length >= budget || hops.length >= budget * 2) return "maxNodes";
+	const depth = typeof request.maxDepth === "number" ? Math.max(1, Math.floor(request.maxDepth)) : 3;
+	return reached.some((item) => Number(object(item)?.depth) >= depth) ? "maxDepth" : "complete";
+}
+
 function symbol(
 	value: Record<string, unknown>,
 ):
@@ -469,7 +482,7 @@ export async function normalizeResult(
 	const first = primaryLists.find((key) => Array.isArray(root[key]));
 	const shown = first ? (root[first] as unknown[]).length : 0;
 	const total = typeof root.total === "number" ? root.total : undefined;
-	const limit = type === "trace" ? "maxNodes" : type === "details" ? "memberLimit" : "limit";
+	const limit = type === "trace" ? traceLimit(request, root) : type === "details" ? "memberLimit" : "limit";
 	const model: GraphResult = {
 		type,
 		shown,

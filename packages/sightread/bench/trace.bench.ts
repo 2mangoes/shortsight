@@ -4,13 +4,14 @@
 // from issue #37: a small helper called from about 200 components, each used by a page, each page used
 // by an app, and enough other files to make the graph's per-request freshness check realistic.
 //
-// Medians of 3 on an Apple Silicon Mac, @ttsc/graph 0.30.4, 2026-09-28:
+// Medians of 3 on an Apple Silicon Mac. Before @ttsc/graph 0.33.0, a trace stopped at 32 symbols, so sightread
+// walked past it (@ttsc/graph 0.30.4, 2026-09-28); now one graph trace answers (@ttsc/graph 0.33.0, 2026-10-16):
 //
-// | Trace         | One trace per symbol    | One details per level |
-// | ------------- | ----------------------- | --------------------- |
-// | default depth | 6.91s, 242 symbols      | 0.18s, 201 (direct users; the start is a hub) |
-// | maxDepth 2    | 5.82s, 241 symbols      | 0.23s, 241 symbols    |
-// | maxDepth 1    | 0.14s, 201 symbols      | 0.12s, 201 symbols    |
+// | Trace         | One trace per symbol | One details per level | One graph trace |
+// | ------------- | -------------------- | --------------------- | --------------- |
+// | default depth | 6.91s, 242 symbols   | 0.18s, 201 (direct users; the start is a hub) | 0.07s, 201 |
+// | maxDepth 2    | 5.82s, 241 symbols   | 0.23s, 241 symbols    | 0.09s, 241 symbols |
+// | maxDepth 1    | 0.14s, 201 symbols   | 0.12s, 201 symbols    | 0.07s, 201 symbols |
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";

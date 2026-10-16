@@ -19,6 +19,10 @@ export interface Impact {
 	server: ServerConnection;
 }
 
+// The graph caps a trace at the symbols asked for and twice as many hops. Within that, an impact trace holds every
+// caller three levels up; past it, the nearest callers come from a reverse trace too.
+const IMPACT_LIMIT = 200;
+const REVERSE_LIMIT = 24;
 const testFile = (file: string) => /\.test\.|\.spec\.|(?:^|\/)__tests__\//.test(file);
 const trace = (symbol: ChangedSymbol, direction: "impact" | "reverse", maxNodes: number) => ({
 	type: "trace",
@@ -37,6 +41,14 @@ const startLine = (value: unknown) => {
 const edgesOf = (value: unknown): Record<string, unknown>[] => {
 	const hops = result(value).hops;
 	return Array.isArray(hops) ? hops.filter((item): item is Record<string, unknown> => !!object(item)) : [];
+};
+// Truncated with a full budget: the budget cut the walk, not its depth.
+const capped = (value: unknown) => {
+	const reached = result(value).reached;
+	return (
+		result(value).truncated === true &&
+		((Array.isArray(reached) && reached.length >= IMPACT_LIMIT) || edgesOf(value).length >= IMPACT_LIMIT * 2)
+	);
 };
 
 function searchable(item: ChangedSymbol, declarations: Declaration[]): boolean {
@@ -202,7 +214,7 @@ function selectChanges(matched: MatchedChanges) {
 async function queryGraph(project: Project, changed: ChangedSymbol[]) {
 	const active = changed.filter(({ node }) => node.status !== "deleted");
 	let server = await connect(project);
-	const requests = active.map((item) => trace(item, "impact", 16));
+	const requests = active.map((item) => trace(item, "impact", IMPACT_LIMIT));
 	let values = requests.length ? await server.values(requests) : [];
 	const staleTime = async () => {
 		for (const path of new Set(changed.map(({ node }) => node.file))) {
@@ -261,11 +273,9 @@ function createLookup(git: GitChanges, project: Project, parser: DeclarationPars
 }
 
 async function reverseFallback(active: ChangedSymbol[], values: unknown[], server: ServerConnection) {
-	const truncated = active.flatMap((item, index) =>
-		result(values[index]).truncated === true ? [{ item, index }] : [],
-	);
+	const truncated = active.flatMap((item, index) => (capped(values[index]) ? [{ item, index }] : []));
 	const reverseValues = truncated.length
-		? await server.values(truncated.map(({ item }) => trace(item, "reverse", 24)))
+		? await server.values(truncated.map(({ item }) => trace(item, "reverse", REVERSE_LIMIT)))
 		: [];
 	const reverseByIndex = new Map(truncated.map(({ index }, position) => [index, reverseValues[position]]));
 	return reverseByIndex;
@@ -370,8 +380,8 @@ async function graphChains(input: {
 			continue;
 		}
 		let edges = edgesOf(value);
-		if (result(value).truncated === true) {
-			notes.push(`${item.node.name}: impact truncated at 16 callers; reverse trace used`);
+		if (capped(value)) {
+			notes.push(`${item.node.name}: impact truncated at ${IMPACT_LIMIT} callers; reverse trace used`);
 			value = reverseByIndex.get(index);
 			edges = [...edges, ...edgesOf(value)];
 		}

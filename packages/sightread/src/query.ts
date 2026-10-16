@@ -81,273 +81,213 @@ function filterIn(result: GraphResult, directory: string): GraphResult {
 	});
 }
 
-/** Run one request or a batch and return exactly what the CLI prints. */
-// The graph returns at most this many symbols per trace, however many are asked for.
-const GRAPH_TRACE_LIMIT = 32;
-// The graph's own reverse trace goes three levels deep by default, and at most eight. A completed trace
-// answers the same question: unlimited, it reaches most of a large codebase through its central classes.
-const GRAPH_TRACE_DEPTH = 3;
-const GRAPH_TRACE_MAX_DEPTH = 8;
-const WALK_LIMIT = 1000;
-// `details` lists at most this many dependents per symbol, however many are asked for, and doesn't say when it
-// stopped, so only a shorter list is known to be whole.
-const DETAILS_NEIGHBOR_LIMIT = 3;
-// `details` leaves out `dispatches` edges, from an interface to what implements it, so only symbols that can't
-// implement one are looked up through it.
-const detailsKinds = new Set(["function", "variable", "type"]);
+// A reverse trace answers "what does changing this affect?", so it asks the graph for far more symbols than the
+// graph's default of 12. It goes three levels deep by default, and at most eight: unlimited, it reaches most of a
+// large codebase through its central classes.
+const TRACE_LIMIT = 1000;
+const TRACE_DEPTH = 3;
+const TRACE_MAX_DEPTH = 8;
+// A start with more direct users than this reaches much of the codebase within a few levels, which is too long to
+// read, so without an explicit depth its direct users answer.
+const HUB_USERS = 32;
+// The graph stops an open walk at this many hops per symbol it may return, as well as at the symbols themselves.
+const HOPS_PER_NODE = 2;
+// The graph walks breadth first, so a smaller budget only cuts the same walk sooner. Asking for at least the full
+// limit and cutting it here keeps every hop between the symbols kept, and shows when more were left.
+const budgetFor = (limit: number) => Math.max(limit, TRACE_LIMIT);
+// Truncated, with a full budget: the budget cut the walk, not its depth.
+const budgetSpent = (trace: Record<string, unknown>, budget: number) =>
+	trace.truncated === true &&
+	(records(trace.reached).length >= budget || records(trace.hops).length >= budget * HOPS_PER_NODE);
+
+interface TraceAnswer {
+	value: unknown;
+	note?: string;
+	raise?: string;
+}
+
+const records = (value: unknown): Record<string, unknown>[] =>
+	Array.isArray(value) ? value.flatMap((item) => (object(item) ? [object(item)!] : [])) : [];
+const traceOf = (value: unknown) => object(object(value)?.result) ?? object(value);
 const rawSymbol = (handle: string) => {
 	const parsed = fromHandle(handle);
 	return parsed ? { id: handle, ...parsed } : undefined;
 };
+// Sub-traces start at different depths, so the same hop is matched without its depth.
+const hopKey = ({ depth: _depth, ...hop }: Record<string, unknown>) => JSON.stringify(hop);
 
-// The graph can return only 32 symbols at once. Follow each direct caller through another graph trace. A start
-// the graph has no node for, such as a type literal's member, gets its direct users from its references.
-async function completeTrace(
+// Ask the graph for a reverse trace sightread completes: as many symbols and levels as it allows, cut to direct users
+// for a hub. It reports truncation only where a budget cut the walk, not where the depth asked for ended it.
+async function reverseTrace(
 	context: QueryContext,
 	request: Record<string, unknown>,
-	model: GraphResult,
 	paths: ReturnType<typeof createPaths> | undefined,
-): Promise<void> {
-	if (model.error || model.type !== "trace") return;
-	const nodeless =
-		request.direction === "reverse" && request.to === undefined && !!(await unindexed(context.ranges, request.from));
-	if (!nodeless && model.raise !== "trace.maxNodes") return;
-	const asked = typeof request.maxNodes === "number" ? request.maxNodes : undefined;
+): Promise<TraceAnswer | undefined> {
 	if (
-		!nodeless &&
-		request.direction === "reverse" &&
-		request.to === undefined &&
-		asked !== undefined &&
-		asked <= GRAPH_TRACE_LIMIT
+		request.type !== "trace" ||
+		request.direction !== "reverse" ||
+		request.to !== undefined ||
+		request.complete === true
 	)
-		return;
-	if (
-		request.direction === "reverse" &&
-		request.to === undefined &&
-		(nodeless || asked === undefined || asked > GRAPH_TRACE_LIMIT)
-	) {
-		const start = nodeless
-			? String(request.from)
-			: (paths?.inputToProjectHandle(String(model.sections.start)) ?? String(model.sections.start));
-		const limit = asked ?? WALK_LIMIT;
-		let maxDepth = Math.min(
-			GRAPH_TRACE_MAX_DEPTH,
-			Math.max(1, typeof request.maxDepth === "number" ? request.maxDepth : GRAPH_TRACE_DEPTH),
-		);
-		let hubDepth = false;
-		const depth = new Map([[start, 0]]);
-		const symbols = new Map<string, Record<string, unknown>>();
-		const edges = new Map<string, Record<string, unknown>>();
-		const queue = [start];
-		const lines = new Map<string, string[]>();
-		let truncated = false;
-		let unresolvedHub = false;
-		let skipped = 0;
-		const add = (
-			caller: string,
-			target: string,
-			edge: Record<string, unknown>,
-			level: number,
-			symbol?: Record<string, unknown>,
-		) => {
-			if (caller !== start && !depth.has(caller)) {
-				if (depth.size - 1 >= limit) {
-					truncated = true;
-					return;
-				}
-				depth.set(caller, level + 1);
-				symbols.set(caller, symbol ?? rawSymbol(caller) ?? { id: caller });
-				queue.push(caller);
-			}
-			if (!depth.has(caller)) return;
-			edges.set(JSON.stringify(edge), edge);
-		};
-		// Each level's callers come from one `details` request where it can answer, since every graph request first
-		// checks the whole project for changes; other symbols get their own one-level trace.
-		const dependents = async (targets: string[]): Promise<Map<string, Record<string, unknown>[]>> => {
-			// Nested functions and variables have dotted names too; methods are left out by their kind.
-			const known = targets.filter((target) => {
-				const kind = fromHandle(target)?.kind;
-				return kind !== undefined && detailsKinds.has(kind);
-			});
-			const found = new Map<string, Record<string, unknown>[]>();
-			if (!known.length) return found;
-			try {
-				const answer = await context.client.query({
-					type: "details",
-					handles: known,
-					neighbors: true,
-					neighborLimit: DETAILS_NEIGHBOR_LIMIT,
-				});
-				const nodes = (object(object(answer.value)?.result) ?? object(answer.value))?.nodes;
-				for (const item of Array.isArray(nodes) ? nodes : []) {
-					const node = object(item);
-					const list = node?.dependedOnBy;
-					if (typeof node?.id !== "string" || !known.includes(node.id) || !Array.isArray(list)) continue;
-					if (list.length < DETAILS_NEIGHBOR_LIMIT)
-						found.set(
-							node.id,
-							list.flatMap((entry) => {
-								const dependent = object(entry);
-								return dependent ? [dependent] : [];
-							}),
-						);
-				}
-			} catch {
-				// Every symbol gets its own trace instead.
-			}
-			return found;
-		};
-		// A symbol's direct users from its references, as the graph's trace would list them: what each sits in.
-		const fromReferences = async (target: string, level: number) => {
-			if (!context.references || !paths) {
-				skipped++;
-				return;
-			}
-			try {
-				const refs = await context.references.query({ type: "references", symbol: target }, paths);
-				// The graph's trace follows every kind of use, type references and JSX included, so the fallback does too.
-				for (const node of refs.nodes) {
-					if (!node.in) continue;
-					const caller = paths.inputToProjectHandle(node.in.handle);
-					const file = paths.inputToProjectPath(node.file);
-					let content = lines.get(file);
-					if (!content) {
-						content = (await readFile(resolve(paths.project, file), "utf8")).split(/\r\n|\n|\r/);
-						lines.set(file, content);
-					}
-					const byte = (column: number) =>
-						Buffer.byteLength((content[node.line! - 1] ?? "").slice(0, column - 1), "utf8") + 1;
-					add(
-						caller,
-						target,
-						{
-							from: caller,
-							to: target,
-							// A symbol the graph has no node for is a member or a local, whose uses are reads and writes.
-							kind: !node.call
-								? nodeless
-									? "accesses"
-									: "references"
-								: node.call.line === node.line && node.text?.slice(node.call.col - 1).startsWith("new ")
-									? "instantiates"
-									: "calls",
-							evidence: {
-								file,
-								startLine: node.line,
-								startCol: byte(node.col!),
-								endLine: node.line,
-								endCol: byte(node.endCol!),
-							},
-						},
-						level,
-					);
-				}
-			} catch {
-				skipped++;
-			}
-		};
-		while (queue.length) {
-			const frontier = queue.splice(0).filter((target) => depth.get(target)! < maxDepth);
-			const batched = await dependents(frontier.filter((target) => target !== start));
-			for (const target of frontier) {
-				const level = depth.get(target)!;
-				const listed = batched.get(target);
-				if (listed) {
-					for (const dependent of listed) {
-						// Module-level code is listed under its file, which a reverse trace leaves out.
-						if (typeof dependent.id !== "string" || !fromHandle(dependent.id) || typeof dependent.relation !== "string")
-							continue;
-						const { relation, evidence, ...symbol } = dependent;
-						add(dependent.id, target, { from: dependent.id, to: target, kind: relation, evidence }, level, symbol);
-					}
-					continue;
-				}
-				if (nodeless && target === start) {
-					await fromReferences(target, level);
-					continue;
-				}
-				let direct: Record<string, unknown> | undefined;
-				try {
-					const answer = await context.client.query({
-						type: "trace",
-						from: target,
-						direction: "reverse",
-						maxDepth: 1,
-						maxNodes: GRAPH_TRACE_LIMIT,
-					});
-					if (answer.isError) throw new Error("symbol not found");
-					direct = object(object(answer.value)?.result) ?? object(answer.value);
-					if (!direct || !Array.isArray(direct.reached)) throw new Error("symbol not found");
-				} catch {
-					skipped++;
-					continue;
-				}
-				const reached = direct.reached as unknown[];
-				if (direct.truncated === true && reached.length >= GRAPH_TRACE_LIMIT && context.references && paths) {
-					await fromReferences(target, level);
-					continue;
-				}
-				if (direct.truncated === true && reached.length >= GRAPH_TRACE_LIMIT) {
-					truncated = true;
-					unresolvedHub = true;
-				}
-				for (const item of reached) {
-					const symbol = object(item);
-					if (!symbol || typeof symbol.id !== "string") continue;
-					const caller = symbol.id;
-					for (const hop of Array.isArray(direct.hops) ? direct.hops : []) {
-						const edge = object(hop);
-						if (edge?.from === caller && edge.to === target) add(caller, target, edge, level, symbol);
-					}
-				}
-				for (const hop of Array.isArray(direct.hops) ? direct.hops : []) {
-					const edge = object(hop);
-					if (edge?.from === start && edge.to === target) edges.set(JSON.stringify(edge), edge);
-				}
-			}
-			// A symbol used this widely reaches much of the codebase within a few levels, which is slow to walk and
-			// too long to read, so without an explicit depth its direct users answer.
-			if (frontier[0] === start && typeof request.maxDepth !== "number" && depth.size - 1 > GRAPH_TRACE_LIMIT) {
-				maxDepth = 1;
-				hubDepth = true;
-			}
-		}
-		const completed = await normalizeResult(
-			request,
-			{
-				result: {
-					type: "trace",
-					start: rawSymbol(start),
-					direction: "reverse",
-					hops: [...edges.values()],
-					reached: [...symbols.values()],
-					truncated,
-				},
-			},
-			context.ranges,
-			paths,
-		);
-		Object.assign(model, completed);
-		if (!truncated) delete model.raise;
-		// Say so on the first line too, since a hub's direct users alone can look like the whole answer.
-		if (!truncated && hubDepth) model.raise = "trace.maxDepth";
-		model.note = `${
-			nodeless && !truncated
-				? `complete: ${fromHandle(start)?.name} has no graph node, so its direct users come from its references and theirs from graph traces`
-				: unresolvedHub
-					? `truncated at the graph's ${GRAPH_TRACE_LIMIT}-symbol limit; trace again from the symbols at its edge`
-					: truncated
-						? `stopped at ${limit} symbols; trace from a narrower symbol`
-						: `complete: past the graph's ${GRAPH_TRACE_LIMIT}-symbol limit, callers were followed through graph traces`
-		}${skipped ? `; ${skipped} ${skipped === 1 ? "symbol" : "symbols"} skipped` : ""}${
-			hubDepth
-				? `; only direct users are shown, since there are more than ${GRAPH_TRACE_LIMIT}; pass maxDepth to follow their users too`
-				: ""
-		}`;
+		return undefined;
+	const limit = typeof request.maxNodes === "number" ? request.maxNodes : TRACE_LIMIT;
+	const depthAsked = typeof request.maxDepth === "number";
+	const maxDepth = Math.min(TRACE_MAX_DEPTH, Math.max(1, depthAsked ? (request.maxDepth as number) : TRACE_DEPTH));
+	const nodeless = await unindexed(context.ranges, request.from);
+	let start: Record<string, unknown> | undefined;
+	let walk: Walk;
+	let rest: Record<string, unknown> = {};
+	if (nodeless) {
+		if (!context.references || !paths) return undefined;
+		start = rawSymbol(String(request.from));
+		walk = await fromReferences(context, String(request.from), paths, limit, maxDepth, depthAsked);
+	} else {
+		const { value } = await context.client.query({ ...request, maxNodes: budgetFor(limit), maxDepth });
+		const trace = traceOf(value);
+		if (!trace || !Array.isArray(trace.reached)) return { value };
+		const { reached: found, hops: walked, start: from, steps: _steps, truncated: _truncated, ...other } = trace;
+		start = object(from);
+		rest = other;
+		walk = cut(records(found), records(walked), String(start?.id), limit, budgetSpent(trace, budgetFor(limit)));
 	}
+	let { reached, hops, capped } = walk;
+	const hub = !depthAsked && maxDepth > 1 && reached.filter((symbol) => symbol.depth === 1).length > HUB_USERS;
+	if (hub) {
+		capped = walk.directCapped;
+		reached = reached.filter((symbol) => symbol.depth === 1);
+		hops = hops.filter((hop) => hop.depth === 1);
+	}
+	const notes = [
+		nodeless
+			? `${fromHandle(String(request.from))?.name} has no graph node, so its direct users come from its references`
+			: "",
+		capped ? `stopped at ${limit} symbols; trace from a narrower symbol` : "",
+		hub
+			? `only direct users are shown, since there are more than ${HUB_USERS}; pass maxDepth to follow their users too`
+			: "",
+	].filter(Boolean);
+	return {
+		value: { result: { ...rest, type: "trace", start, direction: "reverse", hops, reached, truncated: capped } },
+		...(notes.length ? { note: notes.join("; ") } : {}),
+		...(hub && !capped ? { raise: "trace.maxDepth" } : {}),
+	};
 }
 
+interface Walk {
+	reached: Record<string, unknown>[];
+	hops: Record<string, unknown>[];
+	/** Symbols were left out, by the limit or the graph's budget. */
+	capped: boolean;
+	/** Direct users were left out. */
+	directCapped: boolean;
+}
+
+// Keep the nearest symbols up to the limit, as the graph's own walk would, and the hops between them. A walk the
+// graph's budget cut found every direct user unless they alone filled it, since it finds them first.
+function cut(
+	found: Record<string, unknown>[],
+	walked: Record<string, unknown>[],
+	start: string,
+	limit: number,
+	budgetCut: boolean,
+): Walk {
+	const reached = found.toSorted((a, b) => Number(a.depth) - Number(b.depth)).slice(0, limit);
+	const ids = new Set([start, ...reached.map((symbol) => String(symbol.id))]);
+	const direct = found.filter((symbol) => symbol.depth === 1).length;
+	return {
+		reached,
+		hops: walked.filter((hop) => ids.has(String(hop.from)) && ids.has(String(hop.to))),
+		capped: budgetCut || found.length > limit,
+		directCapped: direct > limit || (budgetCut && direct >= budgetFor(limit)),
+	};
+}
+
+// A symbol the graph has no node for, such as a type literal's member, gets its direct users from its references,
+// as the graph's trace would list them: what each sits in. Their own users come from graph traces, run together.
+async function fromReferences(
+	context: QueryContext,
+	start: string,
+	paths: ReturnType<typeof createPaths>,
+	limit: number,
+	maxDepth: number,
+	depthAsked: boolean,
+): Promise<Walk> {
+	const depth = new Map<string, number>();
+	const symbols = new Map<string, Record<string, unknown>>();
+	const hops = new Map<string, Record<string, unknown>>();
+	const lines = new Map<string, string[]>();
+	const refs = await context.references!.query({ type: "references", symbol: start }, paths);
+	// The graph's trace follows every kind of use, type references and JSX included, so this does too.
+	for (const node of refs.nodes) {
+		if (!node.in) continue;
+		const caller = paths.inputToProjectHandle(node.in.handle);
+		const file = paths.inputToProjectPath(node.file);
+		let content = lines.get(file);
+		if (!content) {
+			content = (await readFile(resolve(paths.project, file), "utf8")).split(/\r\n|\n|\r/);
+			lines.set(file, content);
+		}
+		const byte = (column: number) =>
+			Buffer.byteLength((content[node.line! - 1] ?? "").slice(0, column - 1), "utf8") + 1;
+		depth.set(caller, 1);
+		if (!symbols.has(caller)) symbols.set(caller, { ...(rawSymbol(caller) ?? { id: caller }), depth: 1 });
+		const hop = {
+			from: caller,
+			to: start,
+			// A member or a local is read and written, unless it's called.
+			kind: !node.call
+				? "accesses"
+				: node.call.line === node.line && node.text?.slice(node.call.col - 1).startsWith("new ")
+					? "instantiates"
+					: "calls",
+			depth: 1,
+			evidence: {
+				file,
+				startLine: node.line,
+				startCol: byte(node.col!),
+				endLine: node.line,
+				endCol: byte(node.endCol!),
+			},
+		};
+		hops.set(hopKey(hop), hop);
+	}
+	const callers = [...symbols.keys()];
+	let budgetCut = false;
+	if (maxDepth > 1 && (depthAsked || callers.length <= HUB_USERS)) {
+		const traces = await Promise.all(
+			callers.map((caller) =>
+				context.client
+					.query({
+						type: "trace",
+						from: caller,
+						direction: "reverse",
+						maxDepth: maxDepth - 1,
+						maxNodes: budgetFor(limit),
+					})
+					.then(({ value, isError }) => (isError ? undefined : traceOf(value)))
+					.catch(() => undefined),
+			),
+		);
+		for (const trace of traces) {
+			if (!trace) continue;
+			if (budgetSpent(trace, budgetFor(limit))) budgetCut = true;
+			for (const symbol of records(trace.reached)) {
+				const level = Number(symbol.depth) + 1;
+				if (typeof symbol.id !== "string" || symbol.id === start || (depth.get(symbol.id) ?? Infinity) <= level)
+					continue;
+				depth.set(symbol.id, level);
+				symbols.set(symbol.id, { ...symbol, depth: level });
+			}
+			for (const hop of records(trace.hops)) hops.set(hopKey(hop), hop);
+		}
+	}
+	// A hop is one level past the symbol it reaches, as in the graph's walk.
+	const walked = [...hops.values()].map((hop) => ({ ...hop, depth: (depth.get(String(hop.to)) ?? 0) + 1 }));
+	// Its direct users come from references, which the graph's budget can't cut.
+	return { ...cut([...symbols.values()], walked, start, limit, budgetCut), directCapped: callers.length > limit };
+}
+
+/** Run one request or a batch and return exactly what the CLI prints. */
 export async function runQuery(
 	context: QueryContext,
 	requests: Record<string, unknown>[],
@@ -380,6 +320,9 @@ export async function runQuery(
 				if (item.request.type === "trace") {
 					const refusal = await traceRefusal(context.ranges, item.request);
 					if (refusal) throw new Error(refusal);
+					// Raw output is the graph's own answer.
+					const traced = mode === "raw" ? undefined : await reverseTrace(context, item.request, paths);
+					if (traced) return traced;
 				}
 				const { value } = await context.client.query(item.request);
 				return item.request.type === "details" ? await withUnindexed(context.ranges, value) : { value };
@@ -406,14 +349,10 @@ export async function runQuery(
 					: normalizeResult(requests[index], result.value, context.ranges, paths),
 		),
 	);
-	for (const [index, result] of results.entries())
+	for (const [index, result] of results.entries()) {
 		if ("note" in result && result.note) models[index].note = result.note;
-	await Promise.all(
-		models.map((model, index) => {
-			const item = resolved[index];
-			return completeTrace(context, "request" in item ? item.request : requests[index], model, paths);
-		}),
-	);
+		if ("raise" in result && typeof result.raise === "string") models[index].raise = result.raise;
+	}
 	for (const model of models) if (context.tsconfig) model.tsconfig = context.tsconfig;
 	for (const model of models) model.nestedProjects = context.nestedProjects ?? [];
 	const filtered = options.in
