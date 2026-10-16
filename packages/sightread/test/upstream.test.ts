@@ -67,19 +67,19 @@ test("batch preserves request order", async () => {
 });
 
 test("rejects unknown types and missing required fields before sending", async () => {
-	expect(client.query({ type: "absent" })).rejects.toThrow(
+	await expect(client.query({ type: "absent" })).rejects.toThrow(
 		new RequestError("unknown request type; run sightread --help"),
 	);
-	expect(client.query({ type: "lookup" })).rejects.toThrow(
+	await expect(client.query({ type: "lookup" })).rejects.toThrow(
 		new RequestError("request.query must be string (got undefined)"),
 	);
 });
 
 test("maps upstream field type and enum validation", async () => {
-	expect(client.query({ type: "lookup", query: 42, limit: "bad" })).rejects.toThrow(
+	await expect(client.query({ type: "lookup", query: 42, limit: "bad" })).rejects.toThrow(
 		new RequestError('request.query must be string (got 42)\nrequest.limit must be (number | undefined) (got "bad")'),
 	);
-	expect(client.query({ type: "trace", from: "greet", direction: "sideways" })).rejects.toThrow(
+	await expect(client.query({ type: "trace", from: "greet", direction: "sideways" })).rejects.toThrow(
 		/request.direction must be .* \(got "sideways"\)/,
 	);
 });
