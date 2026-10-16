@@ -14,6 +14,17 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
+// A rejection, read by awaiting it. Bun's `expect(promise).rejects` waits on a promise still pending in a way that
+// handles the language server's replies seconds late, which on a loaded machine outlasts the test's timeout.
+async function rejection(promise: Promise<unknown>): Promise<Error> {
+	try {
+		await promise;
+	} catch (error) {
+		return error as Error;
+	}
+	throw new Error("expected a rejection");
+}
+
 async function fixture(files: Record<string, string>) {
 	const root = await mkdtemp(path.join(tmpdir(), "shorthand-typescript-"));
 	roots.push(root);
@@ -107,7 +118,7 @@ test("rename rejects overloaded declarations without writing", async () => {
 		"src/use.ts": 'import { format } from "./format";\nexport const result = format(1);\n',
 	});
 
-	await expect(rename(root, { file: "src/format.ts", symbol: "format", to: "render" })).rejects.toThrow(
+	expect((await rejection(rename(root, { file: "src/format.ts", symbol: "format", to: "render" }))).message).toContain(
 		"found more than one declaration",
 	);
 	expect(await Bun.file(path.join(root, "src/format.ts")).text()).toContain("function format");
@@ -125,7 +136,7 @@ test.each([
 		"tsconfig.json": JSON.stringify({ compilerOptions: { strict: true }, include: ["src"] }),
 		"src/app.ts": source,
 	});
-	await expect(rename(root, { file: "src/app.ts", symbol, to: "next" })).rejects.toThrow(message);
+	expect((await rejection(rename(root, { file: "src/app.ts", symbol, to: "next" }))).message).toContain(message);
 	expect(await Bun.file(path.join(root, "src/app.ts")).text()).toBe(source);
 });
 
