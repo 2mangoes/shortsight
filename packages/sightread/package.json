@@ -30,7 +30,8 @@
 		"./package.json": "./package.json"
 	},
 	"publishConfig": {
-		"registry": "https://npm.pkg.github.com"
+		"access": "public",
+		"registry": "https://registry.npmjs.org"
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "1.31.0",

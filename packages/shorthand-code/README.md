@@ -6,7 +6,7 @@ If you use Pi, install pi-shorthand instead. This package is for other agents an
 
 ## Install
 
-This fork uses GitHub Packages. Complete the [registry authentication setup](https://github.com/2mangoes/shortsight#github-packages-authentication) first, even for public packages.
+This fork is public on npm; no login is required. If you previously used GitHub Packages, update the [registry setup](https://github.com/2mangoes/shortsight#npm-registry-setup) first.
 
 Install Bun and your platform's sandbox tools, following [pi-shorthand's install steps](https://github.com/2mangoes/shortsight/tree/main/packages/pi-shorthand#install), then:
 

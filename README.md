@@ -7,20 +7,17 @@ Two tools for coding agents working on TypeScript and JavaScript repositories:
 
 Each works on its own.
 
-This is the `2mangoes` fork. Its packages use the `@2mangoes` scope on GitHub Packages; the CLI names are unchanged. Package availability depends on a release being published.
+This is the `2mangoes` fork. Its packages use the `@2mangoes` scope on the public npm registry; the CLI names are unchanged. No login is needed to install public packages.
 
-## GitHub Packages authentication
+## npm registry setup
 
-Authenticate before installing this fork, including public packages. Create a GitHub personal access token (classic) with `read:packages`, then run:
+If you previously configured this scope for GitHub Packages, point it to npmjs before installing, including when Pi installs into its own npm directory:
 
 ```sh
-npm config set @2mangoes:registry https://npm.pkg.github.com --location=user
-npm login --scope=@2mangoes --auth-type=legacy --registry=https://npm.pkg.github.com
+npm config set @2mangoes:registry https://registry.npmjs.org --location=user
 ```
 
-Use your GitHub username and enter the token at the password prompt. Never put tokens in this repository or chat. Only `@2mangoes` is routed to GitHub; other dependencies and `npm audit` keep using the normal npm registry. The user-level mapping also applies when Pi installs into its own npm directory.
-
-See [publishing instructions](docs/publishing.md) for the manual release workflow and the required public-visibility setup.
+Remove or update any project-level `@2mangoes:registry` entry that still points to GitHub Packages. No GitHub token is needed. See [publishing instructions](docs/publishing.md) for maintainers.
 
 ## `shorthand`
 

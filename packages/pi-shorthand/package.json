@@ -26,7 +26,8 @@
 	],
 	"type": "module",
 	"publishConfig": {
-		"registry": "https://npm.pkg.github.com"
+		"access": "public",
+		"registry": "https://registry.npmjs.org"
 	},
 	"dependencies": {
 		"@2mangoes/shorthand-code": "0.14.0"

@@ -32,7 +32,8 @@
 		"./package.json": "./package.json"
 	},
 	"publishConfig": {
-		"registry": "https://npm.pkg.github.com"
+		"access": "public",
+		"registry": "https://registry.npmjs.org"
 	},
 	"dependencies": {
 		"@ast-grep/cli": "^0.45.3",

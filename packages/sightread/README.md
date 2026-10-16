@@ -6,7 +6,7 @@
 
 ## Install
 
-This fork uses GitHub Packages. Complete the [registry authentication setup](https://github.com/2mangoes/shortsight#github-packages-authentication) first, even for public packages.
+This fork is public on npm; no login is required. If you previously used GitHub Packages, update the [registry setup](https://github.com/2mangoes/shortsight#npm-registry-setup) first.
 
 Install [Bun](https://bun.sh) 1.4 or later, then `sightread`:
 
