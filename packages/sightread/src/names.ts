@@ -143,100 +143,104 @@ export async function resolveNamesSettled(
 		});
 	};
 	const resolved = new Map<string, string | Error>();
-	for (let index = 0; index < names.length; index++) {
-		const given = names[index];
-		const [file, name]: [string | undefined, string] = qualified(given) ?? [undefined, given];
-		const inFile = (handle: string) =>
-			file === undefined ||
-			fromHandle(paths?.toRepositoryHandle(handle) ?? handle)?.file === file ||
-			fromHandle(handle)?.file === file;
-		const handles = hitsFor(file === undefined ? name : given).filter(inFile);
-		// A bare name stays ambiguous between a function and members named like it; `file#name` means the former.
-		let exact = handles.filter(named(name));
-		if (file !== undefined) exact = preferFullName(exact, name);
-		// `src/lib/index.ts#formatAmount` names what a barrel re-exports, perhaps renamed or through a namespace
-		// (`src/index.ts#Accordion.Root`): use its declaration.
-		let namespace: string | undefined;
-		if (!exact.length && file !== undefined && reexport) {
-			const declared = await reexport(file, name).catch(() => undefined);
-			if (declared && "namespace" in declared) namespace = declared.namespace;
-			else if (declared) {
-				// Qualify the query by file, so a common name's other hits can't crowd the declaration out.
-				const query = `${paths?.toProjectPath(declared.file) ?? declared.file}#${declared.name}`;
-				const [lookup] = await client.batch([{ type: "lookup", query, limit: 200 }]);
-				const hits = object(object(lookup.value)?.result)?.hits;
-				exact = (Array.isArray(hits) ? hits : [])
-					.flatMap((hit) => {
-						const id = object(hit)?.id;
-						return typeof id === "string" && fromHandle(id) ? [id] : [];
-					})
-					.filter(
-						(handle) =>
-							named(declared.name)(handle) &&
-							(fromHandle(paths?.toRepositoryHandle(handle) ?? handle)?.file === declared.file ||
-								fromHandle(handle)?.file === declared.file),
-					);
+	// Each name resolves on its own, together, so the graph checks for changes once for the lookups a re-export needs.
+	await Promise.all(
+		names.map(async (given) => {
+			const [file, name]: [string | undefined, string] = qualified(given) ?? [undefined, given];
+			const inFile = (handle: string) =>
+				file === undefined ||
+				fromHandle(paths?.toRepositoryHandle(handle) ?? handle)?.file === file ||
+				fromHandle(handle)?.file === file;
+			const handles = hitsFor(file === undefined ? name : given).filter(inFile);
+			// A bare name stays ambiguous between a function and members named like it; `file#name` means the former.
+			let exact = handles.filter(named(name));
+			if (file !== undefined) exact = preferFullName(exact, name);
+			// `src/lib/index.ts#formatAmount` names what a barrel re-exports, perhaps renamed or through a namespace
+			// (`src/index.ts#Accordion.Root`): use its declaration.
+			let namespace: string | undefined;
+			if (!exact.length && file !== undefined && reexport) {
+				const declared = await reexport(file, name).catch(() => undefined);
+				if (declared && "namespace" in declared) namespace = declared.namespace;
+				else if (declared) {
+					// Qualify the query by file, so a common name's other hits can't crowd the declaration out.
+					const query = `${paths?.toProjectPath(declared.file) ?? declared.file}#${declared.name}`;
+					const [lookup] = await client.batch([{ type: "lookup", query, limit: 200 }]);
+					const hits = object(object(lookup.value)?.result)?.hits;
+					exact = (Array.isArray(hits) ? hits : [])
+						.flatMap((hit) => {
+							const id = object(hit)?.id;
+							return typeof id === "string" && fromHandle(id) ? [id] : [];
+						})
+						.filter(
+							(handle) =>
+								named(declared.name)(handle) &&
+								(fromHandle(paths?.toRepositoryHandle(handle) ?? handle)?.file === declared.file ||
+									fromHandle(handle)?.file === declared.file),
+						);
+				}
 			}
-		}
-		// A name the graph doesn't use is found in the file of what it's declared in: a member the graph keeps no node
-		// for, such as a type literal's (`Props.onChange`), or a namespace member it names without its namespace.
-		if (!exact.length && namespace === undefined && declarations && name.includes(".")) {
-			const owner = name.slice(0, name.indexOf("."));
-			const files =
-				file !== undefined
-					? [paths?.inputToProjectPath(file) ?? file]
-					: hitsFor(owner).flatMap((handle) => {
-							const parsed = fromHandle(handle);
-							return parsed && (parsed.name === owner || parsed.name.startsWith(`${owner}.`)) ? [parsed.file] : [];
-						});
-			const found = await Promise.all(
-				[...new Set(files)].map(async (path) =>
-					((await declarations(path)) ?? [])
-						.filter((declaration) => declaration.name === name)
-						.map((declaration) => handleFor(path, declaration)),
-				),
-			);
-			exact = [...new Set(found.flat())];
-		}
-		if (exact.length > 1) {
-			const listed = exact.map((id) => paths?.toRepositoryHandle(id) ?? id);
-			// `file#name` resolves too, and is what gets copied into the next request, so offer it where it's unique.
-			const shortest = (handle: string) =>
-				listed.filter((other) => withoutKind(other) === withoutKind(handle)).length > 1 ? handle : withoutKind(handle);
-			resolved.set(
-				given,
-				new Error(`${given} is ambiguous; use a handle: ${listed.slice(0, 10).map(shortest).join(", ")}`),
-			);
-		} else if (namespace !== undefined) {
-			resolved.set(
-				given,
-				new Error(`${given} is a namespace, the exports of ${namespace}; name one of them, as ${given}.Name`),
-			);
-		} else if (!exact.length) {
-			const last = name.split(".").at(-1)!;
-			const candidates =
-				[
-					handles,
-					hitsFor(name).filter(inFile),
-					hitsFor(last).filter(inFile),
-					hitsFor(last.slice(0, 3)).filter(inFile),
-				].find((items) => items.length) ?? (hitsFor(last).length ? hitsFor(last) : hitsFor(last.slice(0, 3)));
-			const nearest = candidates.filter((id) => closeName(name, fromHandle(id)!.name));
-			resolved.set(
-				given,
-				new Error(
-					`${given} not found${
-						nearest.length
-							? `; nearest: ${nearest
-									.slice(0, 10)
-									.map((id) => paths?.toRepositoryHandle(id) ?? id)
-									.join(", ")}`
-							: ""
-					}`,
-				),
-			);
-		} else resolved.set(given, exact[0]);
-	}
+			// A name the graph doesn't use is found in the file of what it's declared in: a member the graph keeps no node
+			// for, such as a type literal's (`Props.onChange`), or a namespace member it names without its namespace.
+			if (!exact.length && namespace === undefined && declarations && name.includes(".")) {
+				const owner = name.slice(0, name.indexOf("."));
+				const files =
+					file !== undefined
+						? [paths?.inputToProjectPath(file) ?? file]
+						: hitsFor(owner).flatMap((handle) => {
+								const parsed = fromHandle(handle);
+								return parsed && (parsed.name === owner || parsed.name.startsWith(`${owner}.`)) ? [parsed.file] : [];
+							});
+				const found = await Promise.all(
+					[...new Set(files)].map(async (path) =>
+						((await declarations(path)) ?? [])
+							.filter((declaration) => declaration.name === name)
+							.map((declaration) => handleFor(path, declaration)),
+					),
+				);
+				exact = [...new Set(found.flat())];
+			}
+			if (exact.length > 1) {
+				const listed = exact.map((id) => paths?.toRepositoryHandle(id) ?? id);
+				// `file#name` resolves too, and is what gets copied into the next request, so offer it where it's unique.
+				const shortest = (handle: string) =>
+					listed.filter((other) => withoutKind(other) === withoutKind(handle)).length > 1
+						? handle
+						: withoutKind(handle);
+				resolved.set(
+					given,
+					new Error(`${given} is ambiguous; use a handle: ${listed.slice(0, 10).map(shortest).join(", ")}`),
+				);
+			} else if (namespace !== undefined) {
+				resolved.set(
+					given,
+					new Error(`${given} is a namespace, the exports of ${namespace}; name one of them, as ${given}.Name`),
+				);
+			} else if (!exact.length) {
+				const last = name.split(".").at(-1)!;
+				const candidates =
+					[
+						handles,
+						hitsFor(name).filter(inFile),
+						hitsFor(last).filter(inFile),
+						hitsFor(last.slice(0, 3)).filter(inFile),
+					].find((items) => items.length) ?? (hitsFor(last).length ? hitsFor(last) : hitsFor(last.slice(0, 3)));
+				const nearest = candidates.filter((id) => closeName(name, fromHandle(id)!.name));
+				resolved.set(
+					given,
+					new Error(
+						`${given} not found${
+							nearest.length
+								? `; nearest: ${nearest
+										.slice(0, 10)
+										.map((id) => paths?.toRepositoryHandle(id) ?? id)
+										.join(", ")}`
+								: ""
+						}`,
+					),
+				);
+			} else resolved.set(given, exact[0]);
+		}),
+	);
 	return requests.map((request, index) => {
 		const copy = { ...request };
 		for (const field of fields[String(request.type)] ?? []) {
