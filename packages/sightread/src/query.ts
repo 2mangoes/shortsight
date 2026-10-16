@@ -345,9 +345,6 @@ async function completeTrace(
 				? `; only direct users are shown, since there are more than ${GRAPH_TRACE_LIMIT}; pass maxDepth to follow their users too`
 				: ""
 		}`;
-	} else if ((asked !== undefined && asked >= GRAPH_TRACE_LIMIT) || model.shown >= GRAPH_TRACE_LIMIT) {
-		delete model.raise;
-		model.note = `truncated at the graph's ${GRAPH_TRACE_LIMIT}-symbol limit; trace again from the symbols at its edge`;
 	}
 }
 

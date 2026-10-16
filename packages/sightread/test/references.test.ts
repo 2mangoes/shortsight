@@ -514,12 +514,21 @@ test("a nested project keeps repository handles through the complete graph walk"
 	}
 });
 
-test("a forward trace at the graph's limit says so instead of advising a raise", () => {
-	const [result] = JSON.parse(
-		runIn(wide, "--json", JSON.stringify({ type: "trace", from: "hub", direction: "forward", maxNodes: 100 })).out,
-	) as Array<{ raise?: string; note?: string }>;
-	expect(result.raise).toBeUndefined();
-	expect(result.note).toBe("truncated at the graph's 32-symbol limit; trace again from the symbols at its edge");
+test("a forward trace past 32 symbols gets as many as it asks for, and is told to raise maxNodes for more", () => {
+	const trace = (maxNodes: number) =>
+		(
+			JSON.parse(
+				runIn(wide, "--json", JSON.stringify({ type: "trace", from: "hub", direction: "forward", maxNodes })).out,
+			) as Array<{ nodes: unknown[]; raise?: string; note?: string }>
+		)[0]!;
+	// hub, its 40 direct callees and the target they call.
+	const all = trace(100);
+	expect(all.nodes.length).toBe(42);
+	expect(all.raise).toBeUndefined();
+	expect(all.note).toBeUndefined();
+	const some = trace(35);
+	expect(some.nodes.length).toBe(36);
+	expect(some.raise).toBe("trace.maxNodes");
 });
 
 test("reference containers use the graph's class and interface member handles", () => {

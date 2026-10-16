@@ -1,6 +1,7 @@
 // Verify the live graph client and upstream validation mapping.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { join } from "node:path";
+import { version as graphVersion } from "@ttsc/graph/package.json";
 import { createFixtureProject } from "./fixture.ts";
 import { type GraphClient, mapUpstreamError, RequestError, startGraphClient } from "../src/upstream.ts";
 
@@ -93,7 +94,7 @@ test("maps a wrapper field rejection", () => {
 	const error = mapUpstreamError(content, { draft: { reason: 42 } });
 	expect(error).toBeInstanceOf(RequestError);
 	expect(error?.message).toBe(
-		"server rejected generated wrapper fields; @ttsc/graph 0.30.4 may have changed its request schema",
+		`server rejected generated wrapper fields; @ttsc/graph ${graphVersion} may have changed its request schema`,
 	);
 });
 

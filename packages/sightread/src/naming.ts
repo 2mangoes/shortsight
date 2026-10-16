@@ -47,8 +47,9 @@ export interface Declared {
 	graphName?: string;
 	/**
 	 * Why the graph has no node of its own for it: it's a local holding no function; a member the graph keeps on
-	 * its owner, of a type literal, an enum, an object literal or a class expression, or a parameter property; or
-	 * it shares its graph name with another declaration in its file, which the graph merges it with.
+	 * its owner, of a type literal, an enum, a local or default-exported object literal or a class expression, or a
+	 * parameter property; or it shares its graph name with another declaration in its file, which the graph merges
+	 * it with.
 	 */
 	unindexed?: Unindexed;
 	/** Declared inside a function. */
@@ -117,6 +118,8 @@ interface Context {
 	held: boolean;
 	/** A function here is what a variable with a node holds. */
 	heldByNode: boolean;
+	/** An object literal here is what a variable or member with a node holds, so its members get nodes too. */
+	literalNodes: boolean;
 }
 
 const wrappers = new Set([
@@ -268,7 +271,9 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 					? "nodes"
 					: "named"
 				: isEnumDeclaration(node) || (literal && context.held)
-					? "named"
+					? isObjectLiteralExpression(node) && context.literalNodes
+						? "nodes"
+						: "named"
 					: undefined;
 		const holds =
 			isTypeAliasDeclaration(node) ||
@@ -289,6 +294,9 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 				className: isClassDeclaration(node) || isClassExpression(node) ? names : context.className,
 				held: holds || (context.held && wrappers.has(node.kind)),
 				heldByNode: !!own?.node && isVariableDeclaration(node) && child === node.initializer,
+				literalNodes:
+					(!!own?.node && (isVariableDeclaration(node) || isPropertyAssignment(node)) && child === node.initializer) ||
+					(context.literalNodes && wrappers.has(node.kind)),
 			}),
 		);
 	};
@@ -299,6 +307,7 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 		functionNode: false,
 		held: false,
 		heldByNode: false,
+		literalNodes: false,
 	};
 	source.forEachChild((child) => visit(child, root));
 	// The graph gives two declarations one node when its names for them meet, as `A.hidden` and `B.hidden` both

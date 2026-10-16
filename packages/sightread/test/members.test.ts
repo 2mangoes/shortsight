@@ -28,6 +28,10 @@ const shapes = [
 	"export function fn(options: { inline: number }) { if (options.inline) { const blockLocal = () => 1; return blockLocal(); } return 0; }",
 	"export const ClassExpr = class { ce() {} };",
 	'declare module "./other.ts" { interface Aug { augprop: number } }',
+	"const shortValue = 1;",
+	"export const deepObj = { nest: { deepMethod() { return 1; }, deepField: 2 }, shortValue } satisfies object;",
+	"const wrapped = ({ wrappedField: 1 }) as const;",
+	"export function makesLocal() { const loc = { localMember: wrapped.wrappedField }; return loc.localMember; }",
 ].join("\n");
 
 const uses = [
@@ -105,8 +109,14 @@ test("declarations are named as the graph names them, with what it has no node f
 		"Lit.nested.deep": "property member",
 		"Inter.xprop": "property member",
 		"Color.Red": "property member",
-		"obj.omethod": "method member",
-		"obj.ofield": "property member",
+		// A module-level variable's object literal gives its members nodes, nested and through `as` or `satisfies`.
+		"obj.omethod": "method",
+		"obj.ofield": "property",
+		"deepObj.nest": "property",
+		"deepObj.nest.deepMethod": "method",
+		"deepObj.nest.deepField": "property",
+		"deepObj.shortValue": "property",
+		"wrapped.wrappedField": "property",
 		"Cls.#priv": "property",
 		"Cls.paramProp": "property member",
 		"Cls.method.methodLocal": "variable",
@@ -185,8 +195,8 @@ test("a reference names the innermost declaration the graph has a node for", () 
 		"src/decl.ts#Cls.acc:method",
 		"src/decl.ts#Cls.method.methodLocal:variable",
 	]);
-	// Members of an object literal have no node, so their owner contains what they hold.
-	expect(containers("Lit.lprop").at(-1)).toBe("src/use.tsx#written:variable");
+	// A module-level variable's object literal gives its members nodes, so a member contains what it holds.
+	expect(containers("Lit.lprop").at(-1)).toBe("src/use.tsx#written.lprop:variable");
 });
 
 test("details lists a type alias's members and qualifies an object literal's", () => {
@@ -220,7 +230,7 @@ test("a reverse trace from a member starts from its references; other traces say
 		from: "Lit.lprop",
 		direction: "reverse",
 	});
-	expect(result.nodes.map(({ name }) => name)).toEqual(["Lit.lprop", "readsAll", "element", "written"]);
+	expect(result.nodes.map(({ name }) => name)).toEqual(["Lit.lprop", "readsAll", "element", "written.lprop"]);
 	expect(result.note).toStartWith("complete: Lit.lprop has no graph node");
 	expect(run(JSON.stringify({ type: "trace", from: "Lit.lprop" })).err).toBe(
 		"sightread: trace can only go reverse from Lit.lprop: the graph has no node for it, as it's a member of Lit; trace reverse from it for what uses it, or ask references",
