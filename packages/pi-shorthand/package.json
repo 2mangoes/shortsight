@@ -1,6 +1,6 @@
 {
 	"name": "@2mangoes/pi-shorthand",
-	"version": "0.14.0",
+	"version": "0.15.0",
 	"description": "Pi tool for editing repositories with Bun programs, with first-class support for TypeScript and JavaScript.",
 	"keywords": [
 		"ast-grep",
@@ -30,7 +30,7 @@
 		"registry": "https://registry.npmjs.org"
 	},
 	"dependencies": {
-		"@2mangoes/shorthand-code": "0.14.0"
+		"@2mangoes/shorthand-code": "0.15.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",

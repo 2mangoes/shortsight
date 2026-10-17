@@ -48,9 +48,11 @@ without a separate visibility-setting step.
 ## Publish explicitly
 
 After reviewing the dry run, run the same workflow with **publish** checked.
-Only this mode runs source checks and the supported Linux suite before
-publishing sightread, shorthand-code, then pi-shorthand. Nothing publishes on
-push, tag creation, or GitHub release creation.
+Only this mode runs source checks before publishing sightread, shorthand-code,
+then pi-shorthand. Run the supported Linux suite manually on your workstation
+before publishing. The workflow leaves that step commented out to avoid GitHub
+Actions build costs. Nothing publishes on push, tag creation, or GitHub release
+creation.
 
 Publication is not atomic: if a later upload fails, earlier uploads remain.
 Inspect npmjs versions before retrying; do not blindly rerun an already
