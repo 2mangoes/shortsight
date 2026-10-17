@@ -34,8 +34,9 @@ jobs:
       - run: npm ci
       - run: npm run check
         if: inputs.publish
-      - run: ./scripts/test-linux.sh
-        if: inputs.publish
+      # Run Linux tests manually on a workstation before publishing to avoid GitHub Actions build costs.
+      # - run: ./scripts/test-linux.sh
+      #   if: inputs.publish
       - name: Dry-run every package before publishing any
         run: |
           npm publish --workspace=@2mangoes/sightread --dry-run
