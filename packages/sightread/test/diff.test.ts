@@ -727,10 +727,10 @@ test("added and deleted containers stand for their members", async () => {
 	f.put("client/src/old.ts", "\n");
 	f.put(
 		"client/src/new.ts",
-		"export class New {\n\tmethod() { return 1; }\n}\nexport interface Fresh {\n\tvalue: number;\n}\n",
+		"export class New {\n\tmethod() { return 1; }\n}\nexport interface Fresh {\n\tvalue: number;\n}\nexport type Shape = {\n\tside: number;\n};\nexport const tools = {\n\tmeasure() { return 1; },\n};\n",
 	);
 	expect(await f.run()).toBe(
-		`diff against ${f.sha.slice(0, 12)} in client: 4 changed · used by 0 · tested by 0 files\n\nclient/src/old.ts\n  1-3  Old  deleted (base lines)\n  └─ no callers\n  4-6  Gone  deleted (base lines)\n  └─ no callers\n\nclient/src/new.ts  (new file)\n  1-3  New  added\n  4-6  Fresh  added`,
+		`diff against ${f.sha.slice(0, 12)} in client: 6 changed · used by 0 · tested by 0 files\n\nclient/src/old.ts\n  1-3  Old  deleted (base lines)\n  └─ no callers\n  4-6  Gone  deleted (base lines)\n  └─ no callers\n\nclient/src/new.ts  (new file)\n    1-3  New  added\n    4-6  Fresh  added\n    7-9  Shape  added\n  10-12  tools  added`,
 	);
 }, 30_000);
 

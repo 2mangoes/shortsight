@@ -20,7 +20,7 @@ export interface Declaration {
 	exported?: true;
 	/** Declared inside a function. */
 	local?: true;
-	/** The graph's name for it where that differs, as `helper` for a namespace member it doesn't export. */
+	/** The graph's name for it where that differs: `default` for a default-exported function or class. */
 	graphName?: string;
 	/** Why the graph has no node of its own for it, when it has none. */
 	unindexed?: Unindexed;

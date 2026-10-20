@@ -202,7 +202,7 @@ function cut(
 	};
 }
 
-// A symbol the graph has no node for, such as a type literal's member, gets its direct users from its references,
+// A symbol the graph has no node for, such as an enum's member, gets its direct users from its references,
 // as the graph's trace would list them: what each sits in. Their own users come from graph traces, run together.
 async function fromReferences(
 	context: QueryContext,

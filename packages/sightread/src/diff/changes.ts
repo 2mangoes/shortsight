@@ -38,6 +38,8 @@ export async function matchChanges(
 	parser: DeclarationParser,
 ): Promise<MatchedChanges> {
 	const changed: ChangedSymbol[] = [];
+	// A class's, an interface's, a type's or an object literal's properties and methods, as opposed to its locals.
+	const memberSymbols = new Set<ChangedSymbol>();
 	const notes: string[] = [];
 	const files = new Map<string, GitFile>();
 	const current = new Map<string, Declaration[]>();
@@ -115,20 +117,24 @@ export async function matchChanges(
 				...(status === "moved" ? { oldPath: file.oldPath } : {}),
 				...(status === "deleted" ? { baseRanges: ranges(oldMembers) } : {}),
 			};
-			changed.push({ node, codeStarts: members.map(({ codeStart }) => codeStart), file });
+			const symbol = { node, codeStarts: members.map(({ codeStart }) => codeStart), file };
+			changed.push(symbol);
+			if (first.kind === "property" || first.kind === "method") memberSymbols.add(symbol);
 		}
 	}
 	if (nonTs > 10) notes.push(`... ${nonTs - 10} more non-TS files`);
 	if (outside > 10) notes.push(`... ${outside - 10} more outside-project files`);
-	const containers = changed.filter(
-		({ node }) => (node.kind === "class" || node.kind === "interface") && node.status !== "edited",
-	);
+	// An added or deleted declaration stands for its members, which changed with it.
+	const containers = changed.filter(({ node }) => node.status !== "edited");
 	return {
 		changed: changed.filter(
-			({ node }) =>
+			(symbol) =>
+				!memberSymbols.has(symbol) ||
 				!containers.some(
 					({ node: parent }) =>
-						parent.file === node.file && parent.status === node.status && node.name.startsWith(`${parent.name}.`),
+						parent.file === symbol.node.file &&
+						parent.status === symbol.node.status &&
+						symbol.node.name.startsWith(`${parent.name}.`),
 				),
 		),
 		notes,

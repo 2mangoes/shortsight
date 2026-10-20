@@ -36,20 +36,18 @@ import {
 
 export type DeclarationKind = "function" | "class" | "method" | "property" | "variable" | "interface" | "type" | "enum";
 
-export type Unindexed = "local" | "member" | "shared";
+export type Unindexed = "local" | "member";
 
 export interface Declared {
 	node: Node;
 	/** Qualified by everything it's declared in: `Lit.onChange`, `NS.helper`, `render.format`. */
 	name: string;
 	kind: DeclarationKind;
-	/** The graph's name for it, which leaves a namespace off a member the namespace doesn't export. */
+	/** The graph's name for it: `default` for a default-exported function or class. */
 	graphName?: string;
 	/**
-	 * Why the graph has no node of its own for it: it's a local holding no function; a member the graph keeps on
-	 * its owner, of a type literal, an enum, a local or default-exported object literal or a class expression, or a
-	 * parameter property; or it shares its graph name with another declaration in its file, which the graph merges
-	 * it with.
+	 * Why the graph has no node of its own for it: it's a local holding no function, or a member the graph keeps on
+	 * its owner: an enum's, or a literal's or class expression's that nothing with a node holds.
 	 */
 	unindexed?: Unindexed;
 	/** Declared inside a function. */
@@ -100,25 +98,29 @@ export function inObjectLiteral(node: Node): boolean {
 	return !!node.parent && isObjectLiteralExpression(node.parent);
 }
 
-// What a node's children are members of. A class's or an interface's members are nodes when it is one; an enum's,
-// a held literal's and a class expression's are named but never nodes; a literal nothing holds names none.
+// What a node's children are members of. A class's or an interface's members are nodes when it is one, and so are a
+// type or object literal's or a class expression's when what holds it is; an enum's are named but never nodes, and
+// a literal nothing holds names none.
 type Members = "nodes" | "named";
 
 interface Context {
 	names: string[];
-	/** The graph's names for the same scopes, which leave a namespace off a member it doesn't export. */
+	/** The graph's names for the same scopes, which call a default-exported function or class `default`. */
 	graphNames: string[];
 	local: boolean;
 	/** The nearest function is one the graph has a node for, so a local holding a function gets one too. */
 	functionNode: boolean;
 	members?: Members;
-	/** The enclosing class's names, which own its constructor's parameter properties. */
+	/** The enclosing class's names and graph names, which own its constructor's parameter properties. */
 	className?: string[];
+	classGraphName?: string[];
+	/** The enclosing class has a node, so its constructor's parameter properties do too. */
+	classNode?: boolean;
 	/** A type or object literal here belongs to the declaration above it: an alias, a variable, or a named member. */
 	held: boolean;
 	/** A function here is what a variable with a node holds. */
 	heldByNode: boolean;
-	/** An object literal here is what a variable or member with a node holds, so its members get nodes too. */
+	/** A literal here is what a declaration with a node holds, so its members get nodes too. */
 	literalNodes: boolean;
 }
 
@@ -211,7 +213,7 @@ function declare(
 		isIdentifier(node.name) &&
 		parameterProperty.some((kind) => hasModifier(node, kind))
 	)
-		return { name: node.name.text, kind: "property", node: false };
+		return { name: node.name.text, kind: "property", node: !!context.classNode };
 	if (!context.members) return undefined;
 	const member = (name: string, kind: DeclarationKind) => ({ name, kind, node: context.members === "nodes" });
 	if (isConstructorDeclaration(node)) return member("__constructor", "method");
@@ -249,7 +251,12 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 				name: [...(property ? (context.className ?? context.names) : context.names), own.name].join("."),
 				kind: own.kind,
 				...(own.node
-					? { graphName: [...context.graphNames, defaultExport(node) ? "default" : own.name].join(".") }
+					? {
+							graphName: [
+								...(property ? (context.classGraphName ?? context.graphNames) : context.graphNames),
+								defaultExport(node) ? "default" : own.name,
+							].join("."),
+						}
 					: { unindexed: local ? ("local" as const) : ("member" as const) }),
 				local,
 				exported:
@@ -271,7 +278,7 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 					? "nodes"
 					: "named"
 				: isEnumDeclaration(node) || (literal && context.held)
-					? isObjectLiteralExpression(node) && context.literalNodes
+					? literal && context.literalNodes
 						? "nodes"
 						: "named"
 					: undefined;
@@ -282,8 +289,7 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 		node.forEachChild((child) =>
 			visit(child, {
 				names,
-				// The graph leaves the namespace off a member its namespace doesn't export.
-				graphNames: isModuleBlock(node) && !hasModifier(extentOf(child), SyntaxKind.ExportKeyword) ? [] : graphNames,
+				graphNames,
 				local: context.local || functionLike,
 				functionNode: !functionLike
 					? context.functionNode
@@ -292,10 +298,19 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 						: !!own?.node,
 				members,
 				className: isClassDeclaration(node) || isClassExpression(node) ? names : context.className,
+				classGraphName: isClassDeclaration(node) || isClassExpression(node) ? graphNames : context.classGraphName,
+				classNode: isClassDeclaration(node)
+					? !!own?.node
+					: isClassExpression(node)
+						? members === "nodes"
+						: context.classNode,
 				held: holds || (context.held && wrappers.has(node.kind)),
 				heldByNode: !!own?.node && isVariableDeclaration(node) && child === node.initializer,
 				literalNodes:
-					(!!own?.node && (isVariableDeclaration(node) || isPropertyAssignment(node)) && child === node.initializer) ||
+					(!!own?.node &&
+						(((isVariableDeclaration(node) || isPropertyAssignment(node)) && child === node.initializer) ||
+							((isTypeAliasDeclaration(node) || isPropertySignatureDeclaration(node) || isVariableDeclaration(node)) &&
+								child === node.type))) ||
 					(context.literalNodes && wrappers.has(node.kind)),
 			}),
 		);
@@ -310,16 +325,6 @@ export function indexDeclarations(source: SourceFile): DeclarationIndex {
 		literalNodes: false,
 	};
 	source.forEachChild((child) => visit(child, root));
-	// The graph gives two declarations one node when its names for them meet, as `A.hidden` and `B.hidden` both
-	// become `hidden`. Neither can be told apart through it, so neither counts as having one.
-	const graphKey = (declaration: Declared) => `${declaration.graphName}:${graphKind(declaration.kind)}`;
-	const sharing = new Map<string, Set<string>>();
-	for (const declaration of declarations)
-		if (declaration.graphName !== undefined)
-			sharing.set(graphKey(declaration), (sharing.get(graphKey(declaration)) ?? new Set()).add(declaration.name));
-	for (const declaration of declarations)
-		if (declaration.graphName !== undefined && sharing.get(graphKey(declaration))!.size > 1)
-			declaration.unindexed = "shared";
 	const byPlace = new Map(declarations.map((declaration) => [place(declaration.node), declaration]));
 	return { declarations, of: (node) => byPlace.get(place(node)) };
 }

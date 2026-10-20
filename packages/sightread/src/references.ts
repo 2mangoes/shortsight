@@ -82,10 +82,6 @@ function findDeclaration(index: DeclarationIndex, name: string, kind: string): N
 	);
 }
 
-// The declarations the graph merges under one name, which a reference search has to be told apart.
-const merged = (index: DeclarationIndex, name: string) =>
-	index.declarations.filter((declaration) => declaration.unindexed === "shared" && declaration.graphName === name);
-
 // The call or `new` a reference is the callee of, so a call split over lines can be shown whole.
 function enclosingCall(reference: Node): Node | undefined {
 	let callee = reference;
@@ -199,11 +195,6 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 			return index;
 		};
 		const declaration = source && findDeclaration(indexOf(source), ref.name, ref.kind);
-		const shared = source && !declaration ? merged(indexOf(source), ref.name) : [];
-		if (shared.length)
-			throw new Error(
-				`${handle} is ${shared.length} declarations the graph merges; use one: ${shared.map((item) => toHandle(paths.toRepositoryPath(local.split(sep).join("/")), item.name, graphKind(item.kind))).join(", ")}`,
-			);
 		if (!home || !source || !declaration) throw new Error(`${handle} not found`);
 		// Its overloads and merged declarations share its full name.
 		const own = indexOf(source).of(declaration)!.name;

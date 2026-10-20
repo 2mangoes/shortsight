@@ -180,7 +180,7 @@ export async function resolveNamesSettled(
 				}
 			}
 			// A name the graph doesn't use is found in the file of what it's declared in: a member the graph keeps no node
-			// for, such as a type literal's (`Props.onChange`), or a namespace member it names without its namespace.
+			// for, such as an enum's (`Color.Red`).
 			if (!exact.length && namespace === undefined && declarations && name.includes(".")) {
 				const owner = name.slice(0, name.indexOf("."));
 				const files =

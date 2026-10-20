@@ -400,7 +400,8 @@ export async function normalizeResult(
 	for (const alias of aliases) {
 		const own = ((await ranges.declarations(alias.file)) ?? []).filter(
 			(declaration) =>
-				declaration.unindexed === "member" &&
+				!declaration.local &&
+				(declaration.kind === "property" || declaration.kind === "method") &&
 				declaration.name.startsWith(`${alias.name}.`) &&
 				!declaration.name.slice(alias.name.length + 1).includes("."),
 		);

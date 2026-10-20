@@ -126,16 +126,18 @@ test("tour text is complete, including sites and nested flow", () => {
 test("overview text is complete", () => {
 	expect(outputs.get("overview")).toBe(
 		[
-			"overview: 2 files, 9 symbols, 13 relationships",
+			"overview: 2 files, 11 symbols, 17 relationships",
 			"",
 			"layers",
 			"  src  2 files  4 exported",
 			"",
 			"hotspots",
-			"  1. View    exported function  src/View.tsx:2-6  fan-in 0, fan-out 2",
-			"  2. Row     type               src/View.tsx:1-1  fan-in 1, fan-out 0",
-			"  3. caller  exported function  src/model.ts:2-2  fan-in 0, fan-out 1",
-			"  4. greet   exported function  src/model.ts:1-1  fan-in 1, fan-out 0",
+			"  1. View       exported function  src/View.tsx:2-6  fan-in 0, fan-out 4",
+			"  2. Row.id     variable           src/View.tsx:1-1  fan-in 1, fan-out 0",
+			"  3. Row.value  variable           src/View.tsx:1-1  fan-in 1, fan-out 0",
+			"  4. Row        type               src/View.tsx:1-1  fan-in 1, fan-out 0",
+			"  5. caller     exported function  src/model.ts:2-2  fan-in 0, fan-out 1",
+			"  6. greet      exported function  src/model.ts:1-1  fan-in 1, fan-out 0",
 			"",
 			"publicApi",
 			"  1. View     exported function  src/View.tsx:2-6",

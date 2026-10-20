@@ -430,7 +430,7 @@ test("a reverse trace past 32 symbols follows every caller from its hub, in one 
 	expect(result.nodes.find(({ name }) => name === "outer0")?.exported).toBe(true);
 	const text = runIn(wide, JSON.stringify({ type: "trace", from: "target", direction: "reverse", maxDepth: 3 })).out;
 	expect(text).toStartWith(
-		`trace reverse from target: ${result.shown} shown in 82 files; 40 at depth 1, 44 at depth 2, 1 at depth 3\n`,
+		`trace reverse from target: ${result.shown} shown in 82 files; 40 at depth 1, 44 at depth 2, 41 at depth 3\n`,
 	);
 	expect(text).toContain(
 		"  5-5  Child.run               method             calls Base.run :5; overrides Base.run :5\n",
