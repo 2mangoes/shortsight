@@ -28,7 +28,13 @@ export async function withStartLock<T>(directory: string, action: () => Promise<
 			} catch {
 				// A competing process may still be writing the holder file.
 			}
-			const age = Date.now() - (await stat(directory)).mtimeMs;
+			// A lock released since `mkdir` failed is free to take.
+			const held = await stat(directory).catch((reason: NodeJS.ErrnoException) => {
+				if (reason.code === "ENOENT") return undefined;
+				throw reason;
+			});
+			if (!held) continue;
+			const age = Date.now() - held.mtimeMs;
 			if ((pid > 0 && !running(pid)) || (pid === 0 && age > 1_000)) {
 				await rm(directory, { recursive: true, force: true });
 				continue;

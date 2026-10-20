@@ -354,3 +354,117 @@ test("--in keeps each details neighbour list pointing at its own edges", async (
 	expect(named("calls")).toEqual(["src/a.ts#get:function → src/a.ts#normalise:function"]);
 	expect(named("dependedOnBy")).toEqual(["src/a.ts#inside:function → src/a.ts#get:function"]);
 });
+
+test("--in keeps a tour's steps pointing at its own edges", async () => {
+	const seed = (id: string, line: number) => ({ ...symbol(id), file: id.split("#")[0], line });
+	const tourClient: GraphClient = {
+		...client,
+		query: async () => ({
+			value: {
+				result: {
+					type: "tour",
+					seeds: [
+						seed("src/b.ts#outside:function", 3),
+						seed("src/a.ts#inside:function", 4),
+						seed("src/a.ts#target:function", 1),
+					],
+					primaryFlow: {
+						steps: ["outside -[calls at src/b.ts:3]-> target", "inside -[calls at src/a.ts:4]-> target"],
+					},
+				},
+			},
+			isError: false,
+		}),
+	};
+	const [result] = JSON.parse(
+		await runQuery({ client: tourClient, ranges, root: "/tmp" }, [{ type: "tour" }], { mode: "json", in: "src/a.ts" }),
+	) as Array<{ edges: Array<{ from: string; to: string }>; sections: { primaryFlow: { steps: number[] } } }>;
+	expect(
+		result.sections.primaryFlow.steps.map((index) => `${result.edges[index].from} → ${result.edges[index].to}`),
+	).toEqual(["src/a.ts#inside:function → src/a.ts#target:function"]);
+});
+
+test("a reverse trace reads maxNodes as the graph does, and says when the graph withheld a dispatch", async () => {
+	const target = "src/a.ts#target:function";
+	const { graph } = callerGraph({ [target]: [{ id: callerHandle(0) }, { id: callerHandle(1) }] });
+	for (const maxNodes of [0, -1]) {
+		const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target, maxNodes });
+		expect([result.shown, result.raise]).toEqual([1, "trace.maxNodes"]);
+		expect(result.note).toBe("stopped at 1 symbol; trace from a narrower symbol");
+	}
+	// The graph marks a walk truncated when it leaves out a dispatch to 12 or more implementations, with neither its
+	// budget full nor its depth reached; only `complete` follows it.
+	const withholding: GraphClient = {
+		...client,
+		query: async (request) => {
+			const { value } = await graph.query({ ...request, maxDepth: 1 });
+			return { value: { result: { ...(value as { result: object }).result, truncated: true } }, isError: false };
+		},
+	};
+	const withheld = await traceWith({ client: withholding, ranges, root: "/tmp" }, { from: target });
+	expect([withheld.shown, withheld.raise]).toEqual([2, "trace.complete"]);
+	expect(withheld.note).toBe("the graph left out a dispatch to 12 or more implementations; pass complete to follow it");
+});
+
+// A reference to `box.prop` on a line of a.ts, inside `handle`.
+const reference = (line: number, handle: string) => ({
+	handle: `a.ts#ref:${line}`,
+	name: "prop",
+	file: "a.ts",
+	ranges: null,
+	line,
+	col: 38,
+	endCol: 42,
+	in: { handle },
+});
+
+test("a member with no node keeps the request's options, follows complete, and says which users it couldn't trace", async () => {
+	const root = mkdtempSync(join(realpathSync("/tmp"), "sr-nodeless-options-"));
+	writeFileSync(
+		join(root, "a.ts"),
+		"export function first() { return box.prop; }\nexport function second() { return box.prop; }\n",
+	);
+	const start = "a.ts#Box.prop:variable";
+	const first = "a.ts#first:function";
+	const second = "a.ts#second:function";
+	const nodeless: RangeIndex = {
+		...ranges,
+		declarations: async () => [
+			{ name: "Box.prop", kind: "property", start: 1, end: 1, codeStart: 1, unindexed: "member" },
+		],
+	};
+	const references = {
+		query: async () => ({
+			type: "references",
+			shown: 2,
+			edges: [],
+			sections: {},
+			nodes: [reference(1, first), reference(2, second)],
+		}),
+		reexport: async () => undefined,
+		close: async () => {},
+	} as unknown as ReferenceIndex;
+	const { graph, sent } = callerGraph({ [first]: [{ id: "a.ts#outer:function" }] });
+	// The second user's own trace fails.
+	const failing: GraphClient = {
+		...graph,
+		query: async (request) => {
+			if (request.from === second) throw new Error("graph went away");
+			return graph.query(request);
+		},
+	};
+	try {
+		const context = { client: failing, ranges: nodeless, references, root };
+		const focused = await traceWith(context, { from: start, maxDepth: 2, focus: "execution" });
+		expect(sent.map(({ from, focus, maxDepth }) => [from, focus, maxDepth])).toEqual([[first, "execution", 1]]);
+		expect(focused.nodes.map(({ name }) => name).toSorted()).toEqual(["Box.prop", "first", "outer", "second"]);
+		expect(focused.note).toBe(
+			"Box.prop has no graph node, so its direct users come from its references; 1 symbol skipped",
+		);
+		sent.length = 0;
+		await traceWith(context, { from: start, complete: true });
+		expect(sent.map(({ from, complete, maxDepth }) => [from, complete, maxDepth])).toEqual([[first, true, undefined]]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});

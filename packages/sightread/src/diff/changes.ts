@@ -25,10 +25,15 @@ export interface MatchedChanges {
 }
 
 const key = (item: Declaration) => `${item.name}:${item.kind}`;
-const smallest = (items: Declaration[], line: number) =>
-	items
-		.filter(({ start, end }) => start <= line && line <= end)
-		.toSorted((a, b) => a.end - a.start - (b.end - b.start))[0];
+// The declarations a changed line belongs to: the smallest holding it, each of several the same size, such as
+// `a` and `b` in `const a = 1, b = 2`, since lines can't tell which changed. A container on one line with its
+// members stands for them.
+const smallest = (items: Declaration[], line: number) => {
+	const holding = items.filter(({ start, end }) => start <= line && line <= end);
+	const size = Math.min(...holding.map(({ start, end }) => end - start));
+	const tied = holding.filter(({ start, end }) => end - start === size);
+	return tied.filter((item) => !tied.some((other) => item.name.startsWith(`${other.name}.`)));
+};
 const ranges = (items: Declaration[]) => items.map(({ start, end }) => ({ start, end }));
 
 /** Attribute changed hunks and lost declarations without graph edges. */
@@ -75,23 +80,21 @@ export async function matchChanges(
 				let matched = false;
 				if (hunk.newCount) {
 					for (let line = hunk.newStart; line < hunk.newStart + hunk.newCount; line++) {
-						const item = smallest(now, line);
-						if (item) {
+						for (const item of smallest(now, line)) {
 							selected.add(key(item));
 							matched = true;
 						}
 					}
 				} else {
-					const item = smallest(now, Math.max(1, hunk.newStart));
-					if (
-						item &&
-						before.some(
-							(prior) => key(prior) === key(item) && prior.start <= hunk.oldStart && hunk.oldStart <= prior.end,
-						)
-					) {
-						selected.add(key(item));
-						matched = true;
-					}
+					for (const item of smallest(now, Math.max(1, hunk.newStart)))
+						if (
+							before.some(
+								(prior) => key(prior) === key(item) && prior.start <= hunk.oldStart && hunk.oldStart <= prior.end,
+							)
+						) {
+							selected.add(key(item));
+							matched = true;
+						}
 				}
 				if (!matched && !before.some((prior) => prior.start <= hunk.oldStart && hunk.oldStart <= prior.end))
 					outsideDeclaration = true;

@@ -854,3 +854,31 @@ test("test sites with and without name matching have separate rows", () => {
 	);
 	expect(text).toContain("tests\nsrc/api.test.ts\n  target on line 4  (by name)\n  target on line 8");
 });
+
+test("declarations sharing a changed line are each attributed, since lines can't tell them apart", async () => {
+	const f = fixture({
+		"client/src/values.ts": "export const a = 1, b = 2;\nexport function useB() {\n\treturn b;\n}\n",
+	});
+	f.put("client/src/values.ts", "export const a = 1, b = 3;\nexport function useB() {\n\treturn b;\n}\n");
+	const output = await f.run();
+	expect(output).toStartWith(`diff against ${f.sha.slice(0, 12)} in client: 2 changed · used by 1`);
+	expect(output).toContain("1-1  a  edited");
+	expect(output).toContain("1-1  b  edited\n  └─ accessed by client/src/values.ts:2-4  useB");
+}, 30_000);
+
+test("a file the project's roots import is in the project", async () => {
+	const f = fixture({
+		"client/src/main.ts": 'import { impl } from "./impl.ts";\nexport const main = () => impl();\n',
+		"client/src/impl.ts": "export function impl() {\n\treturn 1;\n}\n",
+	});
+	f.put(
+		"client/tsconfig.json",
+		'{"compilerOptions":{"allowImportingTsExtensions":true,"noEmit":true},"files":["src/main.ts"]}\n',
+	);
+	git(f.repo, "add", "client/tsconfig.json");
+	git(f.repo, "commit", "-qm", "only main is a root");
+	f.put("client/src/impl.ts", "export function impl() {\n\treturn 2;\n}\n");
+	const output = await f.run();
+	expect(output).not.toContain("outside the graphed project");
+	expect(output).toContain("1-3  impl  edited\n  └─ called by client/src/main.ts:2-2  main");
+}, 30_000);

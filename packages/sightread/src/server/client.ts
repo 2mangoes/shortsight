@@ -55,7 +55,8 @@ const timeoutMessage = "server timed out; try sightread stop";
 class SocketTimeoutError extends Error {}
 class ServerStopError extends Error {}
 
-function exchange(socketPath: string, message: object, timeout = 120_000): Promise<unknown> {
+/** Send one message to a server socket and read its one-line reply. */
+export function exchange(socketPath: string, message: object, timeout = 120_000): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const socket = createConnection(socketPath);
 		let settled = false;
@@ -69,9 +70,11 @@ function exchange(socketPath: string, message: object, timeout = 120_000): Promi
 			if (error) reject(error);
 			else resolve(value);
 		}
+		// Decoded across chunks, so a character split between two isn't corrupted.
+		socket.setEncoding("utf8");
 		socket.on("connect", () => socket.write(`${JSON.stringify(message)}\n`));
-		socket.on("data", (chunk: Buffer) => {
-			body += chunk.toString();
+		socket.on("data", (chunk: string) => {
+			body += chunk;
 			const end = body.indexOf("\n");
 			if (end < 0) return;
 			try {

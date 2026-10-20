@@ -53,6 +53,7 @@ const uses = [
 	"function Comp(props: Lit) { return null; }",
 	"export const element = <Comp lprop={1} lmethod={() => {}} nested={{ deep: 1 }} />;",
 	"export const written: Lit = { lprop: 2, lmethod() {}, nested: { deep: 2 } };",
+	"export type OnlyRed = Color.Red;",
 ].join("\n");
 
 const fixture = createFixtureProject({
@@ -170,7 +171,7 @@ test("every member resolves by name, and references find each use", () => {
 		"Lit.lprop": ["use.tsx:4", "use.tsx:5", "use.tsx:11", "use.tsx:12"],
 		"Lit.nested.deep": ["use.tsx:5", "use.tsx:11", "use.tsx:12"],
 		"Inter.xprop": ["use.tsx:5"],
-		"Color.Red": ["use.tsx:5"],
+		"Color.Red": ["use.tsx:5", "use.tsx:13"],
 		"obj.ofield": ["use.tsx:5"],
 		"obj.omethod": ["use.tsx:5"],
 		"Cls.#priv": ["decl.ts:11", "decl.ts:12"],
@@ -225,6 +226,13 @@ test("details lists a type alias's members and qualifies an object literal's, an
 	);
 	for (const node of result.nodes)
 		expect(node.ranges).toEqual([{ start: expect.any(Number), end: expect.any(Number) }]);
+	// memberLimit says when it leaves a type alias's members out.
+	const limited = query<{ sections: { members: string[] }; raise?: string }>({
+		type: "details",
+		handles: ["Lit"],
+		memberLimit: 1,
+	});
+	expect([limited.sections.members.length, limited.raise]).toEqual([1, "details.memberLimit"]);
 	const member = (handle: string) =>
 		query<{ nodes: Array<{ handle: string }>; note?: string }>({ type: "details", handles: [handle] });
 	expect(member("Lit.lprop").nodes.map(({ handle }) => handle)).toEqual(["src/decl.ts#Lit.lprop:variable"]);
@@ -240,7 +248,25 @@ test("a reverse trace from a member with no node starts from its references; oth
 	expect(trace("Lit.lprop").nodes.map(({ name }) => name)).toEqual(["Lit.lprop", "readsAll", "element"]);
 	expect(trace("Lit.lprop").note).toBeUndefined();
 	expect(run(JSON.stringify({ type: "trace", from: "Lit.lprop" })).code).toBe(0);
-	expect(trace("Color.Red").nodes.map(({ name }) => name)).toEqual(["Color.Red", "readsAll"]);
+	expect(trace("Color.Red").nodes.map(({ name }) => name)).toEqual(["Color.Red", "readsAll", "OnlyRed"]);
+	// A use in a type is a type reference, as the graph calls one; a read is an access.
+	const kinds = query<{ edges: Array<{ from: string; kind: string }> }>({
+		type: "trace",
+		from: "Color.Red",
+		direction: "reverse",
+	}).edges.map(({ from, kind }) => [from, kind]);
+	expect(kinds).toEqual([
+		["src/use.tsx#readsAll:function", "accesses"],
+		["src/use.tsx#OnlyRed:type", "type_ref"],
+	]);
+	expect(
+		query<{ nodes: Array<{ line: number; inType?: true }> }>({ type: "references", symbol: "Color.Red" }).nodes.map(
+			({ line, inType }) => [line, inType ?? false],
+		),
+	).toEqual([
+		[5, false],
+		[13, true],
+	]);
 	expect(trace("Color.Red").note).toBe("Color.Red has no graph node, so its direct users come from its references");
 	expect(run(JSON.stringify({ type: "trace", from: "Color.Red" })).err).toBe(
 		"sightread: trace can only go reverse from Color.Red: the graph has no node for it, as it's a member of Color; trace reverse from it for what uses it, or ask references",

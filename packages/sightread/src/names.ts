@@ -248,11 +248,15 @@ export async function resolveNamesSettled(
 			const entries = Array.isArray(value) ? value : [value];
 			const error = entries.map((item) => resolved.get(item)).find((item) => item instanceof Error);
 			if (error instanceof Error) return { error: error.message };
-			if (typeof value === "string") copy[field] = resolved.get(value) ?? value;
+			// A resolved name is already the graph's own handle; only what was given is converted to the project's terms.
+			const project = (item: string) =>
+				(resolved.get(item) as string | undefined) ?? paths?.inputToProjectHandle(item) ?? item;
+			if (typeof value === "string") copy[field] = project(value);
 			else if (Array.isArray(value))
-				copy[field] = value.map((item) => (typeof item === "string" ? (resolved.get(item) ?? item) : item));
+				copy[field] = value.map((item) => (typeof item === "string" ? project(item) : item));
 		}
-		return settle(copy, index);
+		const alias = aliased[index];
+		return alias instanceof Error ? { error: alias.message } : { request: copy };
 	});
 }
 

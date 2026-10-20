@@ -634,3 +634,39 @@ test("a completed trace from a hub stops at its direct users unless maxDepth say
 		fixture.cleanup();
 	}
 });
+
+test("references follow an edit to a file the project only imports", () => {
+	// The config's roots are src/; lib/ is in the program only because src/ imports it.
+	const project = join(repository, "imports-lib");
+	mkdirSync(join(project, "src"), { recursive: true });
+	mkdirSync(join(project, "lib"), { recursive: true });
+	writeFileSync(
+		join(project, "tsconfig.json"),
+		'{"compilerOptions":{"strict":true,"module":"nodenext"},"include":["src"]}\n',
+	);
+	writeFileSync(
+		join(project, "src/app.ts"),
+		'import { shared } from "../lib/shared.js";\nexport const app = () => shared();\n',
+	);
+	const library = (body: string) =>
+		writeFileSync(
+			join(project, "lib/shared.ts"),
+			`export function shared() { return 1; }\nexport function caller() { return ${body}; }\n`,
+		);
+	library("shared()");
+	const lines = () =>
+		(
+			JSON.parse(
+				runIn(project, "--json", JSON.stringify({ type: "references", symbol: "lib/shared.ts#shared:function" })).out,
+			) as Array<{
+				nodes: Array<{ file: string; line: number }>;
+			}>
+		)[0]!.nodes.map(({ file, line }) => `${file}:${line}`);
+	try {
+		expect(lines()).toContain("lib/shared.ts:2");
+		library("0");
+		expect(lines()).not.toContain("lib/shared.ts:2");
+	} finally {
+		runIn(project, "stop");
+	}
+});

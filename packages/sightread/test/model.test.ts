@@ -1,8 +1,11 @@
 // Check generic normalisation of fields, symbols, edges, and source ranges.
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeResult, omittedKeys } from "../src/model.ts";
 import { preferFullName, resolveNames, resolveNamesSettled } from "../src/names.ts";
+import { createPaths } from "../src/paths.ts";
 import { createRangeIndex, type RangeIndex } from "../src/ranges.ts";
 import { renderText } from "../src/render.ts";
 import { startGraphClient, type GraphClient } from "../src/upstream.ts";
@@ -304,4 +307,48 @@ test("a name that is a symbol's full name doesn't also match members named its l
 	const handles = ["src/hash.ts#hashPassword:function", "src/hash.ts#Other.hashPassword:method"];
 	expect(preferFullName(handles, "hashPassword")).toEqual(["src/hash.ts#hashPassword:function"]);
 	expect(preferFullName(handles.slice(1), "hashPassword")).toEqual(["src/hash.ts#Other.hashPassword:method"]);
+});
+
+test("a truncated path names the bound the graph says stopped it", async () => {
+	const path = (reason: string) =>
+		normalizeResult(
+			{ type: "trace", from: "a", to: "b" },
+			{ next: { action: "inspect", reason }, result: { type: "trace", path: [], truncated: true } },
+			ranges,
+		);
+	expect(
+		(await path("Re-run with a larger `maxDepth` or `complete: true` to search the entire admitted graph.")).raise,
+	).toBe("trace.maxDepth");
+	expect(
+		(await path("No path was found, but the walk did not follow a dispatch fanout of 12 or more implementations."))
+			.raise,
+	).toBe("trace.complete");
+});
+
+test("in a nested project, a resolved name keeps the graph's handle, though the repository has a file at that path", async () => {
+	const repository = mkdtempSync(join(realpathSync("/tmp"), "sr-nested-names-"));
+	try {
+		for (const file of ["src/a.ts", "client/src/a.ts"]) {
+			mkdirSync(join(repository, file, ".."), { recursive: true });
+			writeFileSync(join(repository, file), "export function target() { return 1; }\n");
+		}
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const graph: GraphClient = {
+			requestTypes: () => [],
+			query: async () => ({
+				value: { result: { type: "lookup", hits: [{ id: "src/a.ts#target:function" }] } },
+				isError: false,
+			}),
+			batch: async (requests) => Promise.all(requests.map((request) => graph.query(request))),
+			close: async () => {},
+		};
+		const [resolved] = await resolveNamesSettled(
+			graph,
+			[{ type: "trace", from: "target" }],
+			createPaths(join(repository, "client")),
+		);
+		expect(resolved).toEqual({ request: { type: "trace", from: "src/a.ts#target:function" } });
+	} finally {
+		rmSync(repository, { recursive: true, force: true });
+	}
 });

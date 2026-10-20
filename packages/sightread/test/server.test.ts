@@ -12,10 +12,10 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { createConnection } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { connect, listServers, stopAllServers, stopServer } from "../src/server/client.ts";
+import { connect, exchange, listServers, stopAllServers, stopServer } from "../src/server/client.ts";
 import { serverPaths, stateParent } from "../src/server/paths.ts";
 import { projectSignature } from "../src/server/signature.ts";
 
@@ -593,3 +593,22 @@ test("a hung stop reports the stop timeout and log path", async () => {
 		await until(async () => !(await listServers()).some(({ project: root }) => root === current.root), 10_000);
 	}
 }, 15_000);
+
+test("a reply split inside a character is decoded whole", async () => {
+	const socketPath = join(mkdtempSync(join(realpathSync("/tmp"), "sr-utf8-")), "s");
+	const reply = Buffer.from(`${JSON.stringify({ value: "café ✓" })}\n`);
+	// Split inside "é", whose two bytes come first in the reply after "caf".
+	const split = reply.indexOf(Buffer.from("é")) + 1;
+	const server = createServer((socket) =>
+		socket.once("data", () => {
+			socket.write(reply.subarray(0, split));
+			setTimeout(() => socket.end(reply.subarray(split)), 20);
+		}),
+	);
+	await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+	try {
+		expect(await exchange(socketPath, { type: "ping" })).toBe("café ✓");
+	} finally {
+		server.close();
+	}
+});

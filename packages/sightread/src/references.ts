@@ -9,14 +9,16 @@ import {
 	isConstructorDeclaration,
 	isNewExpression,
 	isPropertyAccessExpression,
+	isQualifiedName,
 	isSourceFile,
+	isTypeNode,
 	SyntaxKind,
 	type Node,
 	type SourceFile,
 } from "typescript/unstable/ast";
 import { fromHandle, toHandle, type GraphNode, type GraphResult } from "./model.ts";
 import type { PathMapper } from "./paths.ts";
-import { projectFiles, type Project } from "./project.ts";
+import { projectFiles, sourceFileNames, type Project } from "./project.ts";
 import {
 	graphKind,
 	indexDeclarations,
@@ -54,6 +56,7 @@ interface Found {
 	text: string;
 	container?: Container;
 	call?: { line: number; col: number; endLine: number; endCol: number; arguments: Range[] };
+	inType?: true;
 }
 
 interface Range {
@@ -91,6 +94,14 @@ function enclosingCall(reference: Node): Node | undefined {
 	return call && (isCallExpression(call) || isNewExpression(call)) && call.expression === callee ? call : undefined;
 }
 
+// A use in a type, as `Color.Red` in `type Only = Color.Red` or `"onChange"` in `Props["onChange"]`, which the graph
+// calls a type reference. An expression a type holds, such as a computed key, is a value's use.
+function inType(reference: Node): boolean {
+	let node = reference;
+	while (node.parent && isQualifiedName(node.parent)) node = node.parent;
+	return !!node.parent && isTypeNode(node.parent);
+}
+
 // The innermost declaration the graph has a node for that a reference sits in: a member, a function or a
 // variable holding one, or a top-level declaration. Imports, re-exports and module-level statements have none.
 function containerOf(
@@ -118,6 +129,18 @@ function containerOf(
 	return undefined;
 }
 
+// Each file's mtime and size, which change when it does.
+async function stampsOf(files: Iterable<string>): Promise<Map<string, string>> {
+	const found = new Map<string, string>();
+	await Promise.all(
+		[...files].map(async (file) => {
+			const metadata = await stat(file).catch(() => undefined);
+			if (metadata) found.set(file, `${metadata.mtimeMs}:${metadata.size}`);
+		}),
+	);
+	return found;
+}
+
 /** Keep one TypeScript language service for a daemon's lifetime, brought up to date before each query. */
 export function createReferenceIndex(project: Project): ReferenceIndex {
 	const api = new API({ cwd: project.root });
@@ -126,18 +149,13 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 	let sequence: Promise<unknown> = Promise.resolve();
 	let closed = false;
 
-	// Compare every project file's size and mtime with the last query's, and send TypeScript only what changed.
+	// Compare the size and mtime of every file the last snapshot loaded, and of the config's roots, with the last
+	// query's, and send TypeScript only what changed. A file only imported, or a declaration file, counts too.
 	const refresh = async (): Promise<Snapshot> => {
 		if (closed) throw new Error("Reference index is closed");
-		const files = await projectFiles(project, api);
-		const current = new Map<string, string>();
-		await Promise.all(
-			[...files].map(async (file) => {
-				const metadata = await stat(file).catch(() => undefined);
-				if (metadata) current.set(file, `${metadata.mtimeMs}:${metadata.size}`);
-			}),
-		);
-		const created = [...current.keys()].filter((file) => !stamps.has(file));
+		const roots = await projectFiles(project, api);
+		const current = await stampsOf(new Set([...roots, ...stamps.keys()]));
+		const created = [...roots].filter((file) => current.has(file) && !stamps.has(file));
 		const changed = [...current.keys()].filter((file) => stamps.has(file) && stamps.get(file) !== current.get(file));
 		const deleted = [...stamps.keys()].filter((file) => !current.has(file));
 		const previous = snapshot;
@@ -149,9 +167,13 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 					fileChanges: { changed, created, deleted },
 				})
 			: await api.updateSnapshot({ openProjects: [project.tsconfig], openFiles: created });
-		// Record the files only once TypeScript has them, so a failed update is retried next time.
+		// Record the files only once TypeScript has them, so a failed update is retried next time: those compared now,
+		// and any the program has just started loading.
+		const loaded = await sourceFileNames(snapshot);
+		const added = await stampsOf([...loaded].filter((file) => !current.has(file)));
 		stamps.clear();
-		for (const [file, stamp] of current) stamps.set(file, stamp);
+		for (const [file, stamp] of [...current, ...added])
+			if (roots.has(file) || loaded.has(file)) stamps.set(file, stamp);
 		if (previous) {
 			api.clearSourceFileCache();
 			await previous.dispose();
@@ -251,6 +273,7 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 					.slice(line, last + 1)
 					.join("\n"),
 				...(container ? { container } : {}),
+				...(inType(reference) ? { inType: true as const } : {}),
 				...(call
 					? {
 							call: {

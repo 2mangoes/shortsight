@@ -1,5 +1,5 @@
 // Run one working-tree diff with one parser and the existing graph daemon.
-import { projectFiles, type Project } from "../project.ts";
+import { programFiles, type Project } from "../project.ts";
 import { isAbsolute, resolve } from "node:path";
 import { createPaths } from "../paths.ts";
 import { createDeclarationParser } from "../ranges.ts";
@@ -19,9 +19,10 @@ export async function runDiff(
 	const parser = createDeclarationParser();
 	try {
 		const matched = await matchChanges(git, project.root, parser);
-		const files = await projectFiles(project);
+		// Every file the compiler loads for the project, not only its config's roots: an imported file is in it too.
+		const files = await programFiles(project);
 		const inProject = ({ node, file }: (typeof matched.changed)[number]) =>
-			files.has(resolve(project.root, node.file)) ||
+			(files.has(resolve(project.root, node.file)) && !/\.d\.[cm]?ts$/.test(node.file)) ||
 			// A deleted file isn't on disk to check against the config, so count it if it was inside the project.
 			(file.status === "deleted" &&
 				!node.file.startsWith("../") &&

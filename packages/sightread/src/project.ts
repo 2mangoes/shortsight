@@ -1,7 +1,7 @@
 // Find the nearest TypeScript project and suggest nearby projects when none contains the start directory.
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { API } from "typescript/unstable/async";
+import { API, type Snapshot } from "typescript/unstable/async";
 
 export interface Project {
 	/** Absolute directory containing the tsconfig. */
@@ -26,6 +26,30 @@ export async function projectFiles(project: Project, shared?: API): Promise<Set<
 		);
 	} finally {
 		if (!shared) await api.close();
+	}
+}
+
+/** Every file a TypeScript program for the project loads outside node_modules: its roots and what they import. */
+export async function sourceFileNames(snapshot: Snapshot): Promise<Set<string>> {
+	const files = new Set<string>();
+	for (const opened of snapshot.getProjects())
+		for (const name of await opened.program.getSourceFileNames())
+			if (!name.split(/[\\/]/).includes("node_modules")) files.add(resolve(name));
+	return files;
+}
+
+/** The files the compiler loads for a project, as {@link sourceFileNames}, from a program built for the purpose. */
+export async function programFiles(project: Project): Promise<Set<string>> {
+	const api = new API({ cwd: project.root });
+	try {
+		const snapshot = await api.updateSnapshot({ openProjects: [project.tsconfig] });
+		try {
+			return await sourceFileNames(snapshot);
+		} finally {
+			await snapshot.dispose();
+		}
+	} finally {
+		await api.close();
 	}
 }
 

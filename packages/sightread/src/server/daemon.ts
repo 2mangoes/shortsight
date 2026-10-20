@@ -51,8 +51,10 @@ export async function runDaemon(project: Project): Promise<void> {
 	const server = createServer((socket) => {
 		let input = "";
 		socket.on("error", () => undefined);
-		socket.on("data", (chunk: Buffer) => {
-			input += chunk.toString();
+		// Decoded across chunks, so a character split between two isn't corrupted.
+		socket.setEncoding("utf8");
+		socket.on("data", (chunk: string) => {
+			input += chunk;
 			const end = input.indexOf("\n");
 			if (end < 0) return;
 			socket.removeAllListeners("data");

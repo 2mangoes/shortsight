@@ -2,7 +2,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
-import { fromHandle, object, type GraphNode } from "../model.ts";
+import { fromHandle, object, traceCut, type GraphNode } from "../model.ts";
 import type { Project } from "../project.ts";
 import { handleFor, indexedDeclarations, type Declaration, type DeclarationParser } from "../ranges.ts";
 import { connect, type ServerConnection } from "../server/client.ts";
@@ -42,14 +42,8 @@ const edgesOf = (value: unknown): Record<string, unknown>[] => {
 	const hops = result(value).hops;
 	return Array.isArray(hops) ? hops.filter((item): item is Record<string, unknown> => !!object(item)) : [];
 };
-// Truncated with a full budget: the budget cut the walk, not its depth.
-const capped = (value: unknown) => {
-	const reached = result(value).reached;
-	return (
-		result(value).truncated === true &&
-		((Array.isArray(reached) && reached.length >= IMPACT_LIMIT) || edgesOf(value).length >= IMPACT_LIMIT * 2)
-	);
-};
+// Its budget, not its depth, cut the walk.
+const capped = (value: unknown) => traceCut(result(value), IMPACT_LIMIT, 3) === "maxNodes";
 
 function searchable(item: ChangedSymbol, declarations: Declaration[]): boolean {
 	const indexed = indexedDeclarations(declarations);
