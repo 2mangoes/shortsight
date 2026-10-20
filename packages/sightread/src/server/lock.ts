@@ -13,6 +13,39 @@ function running(pid: number): boolean {
 	}
 }
 
+const holder = (directory: string) =>
+	readFile(join(directory, "pid"), "utf8").then(
+		(text) => Number(text),
+		() => 0,
+	);
+
+// Remove a dead holder's lock, one reclaimer at a time. Two that both saw it dead would otherwise race: the second
+// could remove the lock the first has just taken. Under the guard, the holder is checked again before removal. A
+// guard older than a few seconds was left by a reclaimer that died, and is removed in turn. Returns whether it ran.
+async function reclaim(directory: string): Promise<boolean> {
+	const guard = `${directory}.reclaim`;
+	try {
+		await mkdir(guard);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		const age = await stat(guard).then(
+			(found) => Date.now() - found.mtimeMs,
+			() => 0,
+		);
+		if (age > 5_000) await rm(guard, { recursive: true, force: true });
+		return false;
+	}
+	try {
+		const pid = await holder(directory);
+		const held = await stat(directory).catch(() => undefined);
+		if (held && ((pid > 0 && !running(pid)) || (pid === 0 && Date.now() - held.mtimeMs > 1_000)))
+			await rm(directory, { recursive: true, force: true });
+		return true;
+	} finally {
+		await rm(guard, { recursive: true, force: true });
+	}
+}
+
 export async function withStartLock<T>(directory: string, action: () => Promise<T>): Promise<T> {
 	const until = Date.now() + 15_000;
 	await mkdir(join(directory, ".."), { recursive: true });
@@ -22,12 +55,8 @@ export async function withStartLock<T>(directory: string, action: () => Promise<
 			break;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			let pid = 0;
-			try {
-				pid = Number(await readFile(join(directory, "pid"), "utf8"));
-			} catch {
-				// A competing process may still be writing the holder file.
-			}
+			// A competing process may still be writing the holder file.
+			const pid = await holder(directory);
 			// A lock released since `mkdir` failed is free to take.
 			const held = await stat(directory).catch((reason: NodeJS.ErrnoException) => {
 				if (reason.code === "ENOENT") return undefined;
@@ -36,7 +65,7 @@ export async function withStartLock<T>(directory: string, action: () => Promise<
 			if (!held) continue;
 			const age = Date.now() - held.mtimeMs;
 			if ((pid > 0 && !running(pid)) || (pid === 0 && age > 1_000)) {
-				await rm(directory, { recursive: true, force: true });
+				if (!(await reclaim(directory))) await pause(20);
 				continue;
 			}
 			if (Date.now() >= until) throw new Error("server start lock timed out; retry", { cause: error });

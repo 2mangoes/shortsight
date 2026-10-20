@@ -181,9 +181,9 @@ test("reverse trace honors maxNodes and maxDepth, and says which bound cut it", 
 	expect(many.note).toBe(
 		"stopped at 35 symbols; trace from a narrower symbol; only direct users are shown, since there are more than 32; pass maxDepth to follow their users too",
 	);
-	// A depth asked for ends the walk without truncating it.
+	// A walk that reached the depth asked for, with users beyond it, says to raise the depth.
 	const one = await ask(undefined, 1);
-	expect([one.shown, one.raise, one.note]).toEqual([41, undefined, undefined]);
+	expect([one.shown, one.raise, one.note]).toEqual([41, "trace.maxDepth", undefined]);
 	expect((await ask(undefined, 2)).shown).toBe(42);
 	// With more direct users than 32, the default is one level; asked, never more than eight.
 	const hub = await ask();
@@ -464,6 +464,59 @@ test("a member with no node keeps the request's options, follows complete, and s
 		sent.length = 0;
 		await traceWith(context, { from: start, complete: true });
 		expect(sent.map(({ from, complete, maxDepth }) => [from, complete, maxDepth])).toEqual([[first, true, undefined]]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a reverse trace whose hop budget ran out on its direct users says it left some out", async () => {
+	const target = "src/a.ts#target:function";
+	// Forty-one callers, each calling the target fifty times: 2,050 hops before any second level, past the hop budget
+	// of 2,000 that comes with 1,000 symbols.
+	const callers = Array.from({ length: 41 }, (_, index) => callerHandle(index));
+	const { graph } = callerGraph({ [target]: callers.flatMap((id) => Array.from({ length: 50 }, () => ({ id }))) });
+	const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target });
+	expect(result.shown).toBe(40);
+	expect(result.raise).toBe("trace.maxNodes");
+	expect(result.note).toStartWith("stopped at 1000 symbols");
+});
+
+test("a member with no node follows focus from its first hop", async () => {
+	const root = mkdtempSync(join(realpathSync("/tmp"), "sr-nodeless-focus-"));
+	writeFileSync(
+		join(root, "a.ts"),
+		"export function reads() { return box.prop; }\nexport type Typed = typeof box.prop;\n",
+	);
+	const start = "a.ts#Box.prop:variable";
+	const nodeless: RangeIndex = {
+		...ranges,
+		declarations: async () => [
+			{ name: "Box.prop", kind: "property", start: 1, end: 1, codeStart: 1, unindexed: "member" },
+		],
+	};
+	const references = {
+		query: async () => ({
+			type: "references",
+			shown: 2,
+			edges: [],
+			sections: {},
+			nodes: [reference(1, "a.ts#reads:function"), { ...reference(2, "a.ts#Typed:type"), inType: true }],
+		}),
+		reexport: async () => undefined,
+		close: async () => {},
+	} as unknown as ReferenceIndex;
+	const { graph } = callerGraph({});
+	try {
+		const kinds = async (focus?: string) =>
+			(
+				await traceWith(
+					{ client: graph, ranges: nodeless, references, root },
+					{ from: start, maxDepth: 1, ...(focus ? { focus } : {}) },
+				)
+			).edges.map(({ kind }) => kind);
+		expect(await kinds()).toEqual(["accesses", "type_ref"]);
+		expect(await kinds("execution")).toEqual(["accesses"]);
+		expect(await kinds("types")).toEqual(["type_ref"]);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

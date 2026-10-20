@@ -1,7 +1,7 @@
 // Hold the graph and range cache behind a Unix socket.
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { rename, writeFile, unlink } from "node:fs/promises";
+import { readFile, rename, stat, writeFile, unlink } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { join, relative, sep } from "node:path";
 import { nestedProjects, projectFiles, type Project } from "../project.ts";
@@ -30,6 +30,13 @@ function duration(name: string, fallback: number): number {
 }
 
 /** Run until stopped, idle, or the project disappears. */
+// A file's device and inode, which a new file at the same path doesn't share.
+const identity = (path: string) =>
+	stat(path).then(
+		(found) => `${found.dev}:${found.ino}`,
+		() => undefined,
+	);
+
 export async function runDaemon(project: Project): Promise<void> {
 	if (process.env.SIGHTREAD_DAEMON_FAIL === "1") throw new Error("test daemon startup failure");
 	if (process.env.SIGHTREAD_DAEMON_START_DELAY_MS) await Bun.sleep(duration("SIGHTREAD_DAEMON_START_DELAY_MS", 0));
@@ -49,6 +56,11 @@ export async function runDaemon(project: Project): Promise<void> {
 	const idle = duration("SIGHTREAD_IDLE_MS", 20 * 60_000);
 	const check = Math.min(duration("SIGHTREAD_MISSING_MS", 30_000), idle);
 	const server = createServer((socket) => {
+		// A daemon shutting down takes no more requests.
+		if (closing) {
+			socket.destroy();
+			return;
+		}
 		let input = "";
 		socket.on("error", () => undefined);
 		// Decoded across chunks, so a character split between two isn't corrupted.
@@ -65,7 +77,21 @@ export async function runDaemon(project: Project): Promise<void> {
 		});
 	});
 
+	// The socket this daemon listens on, by device and inode: a replacement started while this one finishes its last
+	// queries listens on a new file at the same path, which isn't this daemon's to remove.
+	let socketIdentity: string | undefined;
+	async function removeOwnFiles(): Promise<void> {
+		if (socketIdentity && (await identity(paths.socket)) === socketIdentity)
+			await unlink(paths.socket).catch(() => undefined);
+		const state = await readFile(paths.state, "utf8")
+			.then((text) => JSON.parse(text) as { pid?: number })
+			.catch(() => undefined);
+		if (state?.pid === process.pid) await unlink(paths.state).catch(() => undefined);
+	}
+
 	async function writeState(): Promise<void> {
+		// Once closing, the state path may already be a replacement's.
+		if (closing) return;
 		const temporary = `${paths.state}.${randomUUID()}`;
 		await writeFile(
 			temporary,
@@ -85,7 +111,10 @@ export async function runDaemon(project: Project): Promise<void> {
 		if (closing) return;
 		closing = true;
 		clearInterval(interval);
-		server.close();
+		// Bun's close removes whatever file is at the socket's path. A socket a replacement has put there is left alone:
+		// nothing reaches this daemon through it, so the listener only stops keeping the process alive.
+		if ((await identity(paths.socket)) === socketIdentity) server.close();
+		else server.unref();
 		if (active > 0)
 			await new Promise<void>((resolve) => {
 				finishActive = resolve;
@@ -95,8 +124,7 @@ export async function runDaemon(project: Project): Promise<void> {
 		} finally {
 			await ranges.close();
 			await references.close();
-			await unlink(paths.socket).catch(() => undefined);
-			await unlink(paths.state).catch(() => undefined);
+			await removeOwnFiles();
 		}
 	}
 
@@ -199,12 +227,13 @@ export async function runDaemon(project: Project): Promise<void> {
 				resolve();
 			});
 		});
+		socketIdentity = await identity(paths.socket);
 	} catch (error) {
 		clearInterval(interval);
 		await client.close();
 		await ranges.close();
 		await references.close();
-		await unlink(paths.state).catch(() => undefined);
+		await removeOwnFiles();
 		throw error;
 	}
 }

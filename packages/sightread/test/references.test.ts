@@ -666,6 +666,13 @@ test("references follow an edit to a file the project only imports", () => {
 		expect(lines()).toContain("lib/shared.ts:2");
 		library("0");
 		expect(lines()).not.toContain("lib/shared.ts:2");
+		// Gone and back again, it's seen once more.
+		unlinkSync(join(project, "lib/shared.ts"));
+		expect(
+			runIn(project, JSON.stringify({ type: "references", symbol: "lib/shared.ts#shared:function" })).code,
+		).not.toBe(0);
+		library("shared()");
+		expect(lines()).toContain("lib/shared.ts:2");
 	} finally {
 		runIn(project, "stop");
 	}

@@ -5,7 +5,9 @@ import {
 	existsSync,
 	mkdtempSync,
 	mkdirSync,
+	readFileSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -16,6 +18,7 @@ import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { connect, exchange, listServers, stopAllServers, stopServer } from "../src/server/client.ts";
+import { withStartLock } from "../src/server/lock.ts";
 import { serverPaths, stateParent } from "../src/server/paths.ts";
 import { projectSignature } from "../src/server/signature.ts";
 
@@ -612,3 +615,63 @@ test("a reply split inside a character is decoded whole", async () => {
 		server.close();
 	}
 });
+
+test("a stopping daemon leaves a replacement's socket and state alone", async () => {
+	await stopAllServers();
+	const current = project(first.root);
+	const paths = serverPaths(current);
+	const retiring = await connect(current);
+	// A replacement takes the paths while the old daemon is still finishing: its socket is moved aside, so it can
+	// still be told to stop.
+	const aside = `${paths.socket}.old`;
+	renameSync(paths.socket, aside);
+	const replacement = createServer(() => undefined);
+	await new Promise<void>((resolve) => replacement.listen(paths.socket, resolve));
+	const state = JSON.stringify({
+		project: current.root,
+		tsconfig: current.tsconfig,
+		pid: 1,
+		lastUsed: 0,
+		startedAt: 0,
+	});
+	writeFileSync(paths.state, state);
+	try {
+		await exchange(aside, { type: "stop" });
+		await until(async () => {
+			try {
+				process.kill(retiring.pid, 0);
+				return false;
+			} catch {
+				return true;
+			}
+		}, 15_000);
+		expect(existsSync(paths.socket)).toBe(true);
+		expect(readFileSync(paths.state, "utf8")).toBe(state);
+	} finally {
+		replacement.close();
+		rmSync(aside, { force: true });
+		rmSync(paths.state, { force: true });
+	}
+}, 45_000);
+
+test("starters reclaiming a dead holder's lock never hold it together", async () => {
+	const directory = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-")), "start.lock");
+	let holding = 0;
+	let most = 0;
+	for (let round = 0; round < 5; round++) {
+		mkdirSync(directory);
+		// A process id that isn't running.
+		writeFileSync(join(directory, "pid"), "2147483646");
+		await Promise.all(
+			Array.from({ length: 20 }, () =>
+				withStartLock(directory, async () => {
+					most = Math.max(most, ++holding);
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					holding--;
+				}),
+			),
+		);
+	}
+	expect(most).toBe(1);
+	expect(existsSync(directory)).toBe(false);
+}, 30_000);

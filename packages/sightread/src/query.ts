@@ -171,6 +171,7 @@ async function reverseTrace(
 		const why = traceCut(trace, budget, maxDepth);
 		walk = cut(records(found), records(walked), String(start?.id), limit, why === "maxNodes");
 		walk.withheld = why === "complete";
+		walk.deeper = why === "maxDepth";
 	}
 	let { reached, hops, capped } = walk;
 	const hub =
@@ -180,8 +181,7 @@ async function reverseTrace(
 		reached = reached.filter((symbol) => symbol.depth === 1);
 		hops = hops.filter((hop) => hop.depth === 1);
 	}
-	// A hub shows only its direct users, which the graph finds before any fanout past them.
-	const withheld = walk.withheld && !hub;
+	const { withheld } = walk;
 	const notes = [
 		nodeless
 			? `${fromHandle(String(request.from))?.name} has no graph node, so its direct users come from its references`
@@ -198,7 +198,9 @@ async function reverseTrace(
 	return {
 		value: { result: { ...rest, type: "trace", start, direction: "reverse", hops, reached, truncated: capped } },
 		...(notes.length ? { note: notes.join("; ") } : {}),
-		...(capped ? {} : hub ? { raise: "trace.maxDepth" } : withheld ? { raise: "trace.complete" } : {}),
+		// The graph can't say whether a walk that reached its depth also withheld a dispatch, so the depth is what to
+		// raise first; a walk that ends short of it and is still cut has only that dispatch left.
+		...(capped ? {} : hub || walk.deeper ? { raise: "trace.maxDepth" } : withheld ? { raise: "trace.complete" } : {}),
 	};
 }
 
@@ -211,6 +213,8 @@ interface Walk {
 	directCapped: boolean;
 	/** The graph withheld a dispatch fanout of 12 or more implementations. */
 	withheld: boolean;
+	/** The walk reached its depth with more beyond it, as far as the graph can tell. */
+	deeper: boolean;
 	/** Direct users whose own users couldn't be traced, or references that couldn't be read. */
 	skipped: number;
 }
@@ -231,8 +235,12 @@ function cut(
 		reached,
 		hops: walked.filter((hop) => ids.has(String(hop.from)) && ids.has(String(hop.to))),
 		capped: budgetCut || found.length > limit,
-		directCapped: direct > limit || (budgetCut && direct >= budgetFor(limit)),
+		// A budget that ran out before the walk got past its direct users, by symbols or by hops, may have missed some.
+		directCapped:
+			direct > limit ||
+			(budgetCut && (direct >= budgetFor(limit) || !found.some((symbol) => Number(symbol.depth) > 1))),
 		withheld: false,
+		deeper: false,
 		skipped: 0,
 	};
 }
@@ -279,19 +287,23 @@ async function fromReferences(
 		}
 		const byte = (column: number) =>
 			Buffer.byteLength((content[node.line! - 1] ?? "").slice(0, column - 1), "utf8") + 1;
+		// A member or a local is read and written, unless it's called or named in a type.
+		const kind = !node.call
+			? node.inType
+				? "type_ref"
+				: "accesses"
+			: node.call.line === node.line && node.text?.slice(node.call.col - 1).startsWith("new ")
+				? "instantiates"
+				: "calls";
+		// The graph's focus: execution follows what runs, types follows type references.
+		if (request.focus === "execution" ? kind === "type_ref" : request.focus === "types" && kind !== "type_ref")
+			continue;
 		depth.set(caller, 1);
 		if (!symbols.has(caller)) symbols.set(caller, { ...(rawSymbol(caller) ?? { id: caller }), depth: 1 });
 		const hop = {
 			from: caller,
 			to: start,
-			// A member or a local is read and written, unless it's called or named in a type.
-			kind: !node.call
-				? node.inType
-					? "type_ref"
-					: "accesses"
-				: node.call.line === node.line && node.text?.slice(node.call.col - 1).startsWith("new ")
-					? "instantiates"
-					: "calls",
+			kind,
 			depth: 1,
 			evidence: {
 				file,
@@ -307,6 +319,7 @@ async function fromReferences(
 	const budget = budgetFor(limit);
 	let budgetCut = false;
 	let withheld = false;
+	let deeper = false;
 	if (maxDepth > 1 && (complete || depthAsked || callers.length <= HUB_USERS)) {
 		const {
 			type: _type,
@@ -337,6 +350,7 @@ async function fromReferences(
 			const why = complete ? undefined : traceCut(trace, budget, maxDepth - 1);
 			if (why === "maxNodes") budgetCut = true;
 			if (why === "complete") withheld = true;
+			if (why === "maxDepth") deeper = true;
 			for (const symbol of records(trace.reached)) {
 				const level = Number(symbol.depth) + 1;
 				if (typeof symbol.id !== "string" || symbol.id === start || (depth.get(symbol.id) ?? Infinity) <= level)
@@ -354,6 +368,7 @@ async function fromReferences(
 		...cut([...symbols.values()], walked, start, limit, budgetCut),
 		directCapped: callers.length > limit,
 		withheld,
+		deeper,
 		skipped,
 	};
 }

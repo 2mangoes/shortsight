@@ -145,6 +145,8 @@ async function stampsOf(files: Iterable<string>): Promise<Map<string, string>> {
 export function createReferenceIndex(project: Project): ReferenceIndex {
 	const api = new API({ cwd: project.root });
 	const stamps = new Map<string, string>();
+	// Files the program loaded that have since gone, so their return is seen as a new file.
+	const missing = new Set<string>();
 	let snapshot: Snapshot | undefined;
 	let sequence: Promise<unknown> = Promise.resolve();
 	let closed = false;
@@ -154,15 +156,16 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 	const refresh = async (): Promise<Snapshot> => {
 		if (closed) throw new Error("Reference index is closed");
 		const roots = await projectFiles(project, api);
-		const current = await stampsOf(new Set([...roots, ...stamps.keys()]));
-		const created = [...roots].filter((file) => current.has(file) && !stamps.has(file));
+		const current = await stampsOf(new Set([...roots, ...stamps.keys(), ...missing]));
+		const created = [...current.keys()].filter((file) => !stamps.has(file) && (roots.has(file) || missing.has(file)));
 		const changed = [...current.keys()].filter((file) => stamps.has(file) && stamps.get(file) !== current.get(file));
 		const deleted = [...stamps.keys()].filter((file) => !current.has(file));
 		const previous = snapshot;
 		if (previous && !created.length && !changed.length && !deleted.length) return previous;
 		snapshot = previous
 			? await api.updateSnapshot({
-					openFiles: created,
+					// A root is opened; a file only imported, back again, is resolved through what imports it.
+					openFiles: created.filter((file) => roots.has(file)),
 					closeFiles: deleted,
 					fileChanges: { changed, created, deleted },
 				})
@@ -171,6 +174,8 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		// and any the program has just started loading.
 		const loaded = await sourceFileNames(snapshot);
 		const added = await stampsOf([...loaded].filter((file) => !current.has(file)));
+		for (const file of deleted) missing.add(file);
+		for (const file of created) missing.delete(file);
 		stamps.clear();
 		for (const [file, stamp] of [...current, ...added])
 			if (roots.has(file) || loaded.has(file)) stamps.set(file, stamp);
