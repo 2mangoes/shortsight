@@ -54,7 +54,7 @@ const require = createRequire(import.meta.url);
 const graphPackage = require.resolve("@ttsc/graph/package.json");
 const graphVersion = (require("@ttsc/graph/package.json") as { version: string }).version;
 const graphExecutable = join(dirname(graphPackage), "lib/bin.js");
-const packageDirectory = join(import.meta.dir, "..");
+const packageDirectory = join(import.meta.dirname, "..");
 const wrapperError = `server rejected generated wrapper fields; @ttsc/graph ${graphVersion} may have changed its request schema`;
 
 function enumValues(schema: Schema): string[] | undefined {

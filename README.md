@@ -15,13 +15,7 @@ Each works on its own.
 
 ### Install
 
-Install [Bun](https://bun.sh) 1.4 or later:
-
-```sh
-curl -fsSL https://bun.sh/install | bash
-```
-
-Then:
+It runs on [Node](https://nodejs.org) 22 or later, or [Bun](https://bun.sh) 1.4 or later:
 
 ```sh
 npm i -g sightread
@@ -37,7 +31,13 @@ Instead of a patch, the agent writes a Bun program that can search, rewrite synt
 
 ### Install
 
-Install [Bun](https://bun.sh) 1.4 or later. On macOS, install clang and AgentFS too:
+Install [Bun](https://bun.sh) 1.4 or later:
+
+```sh
+curl -fsSL https://bun.sh/install | bash
+```
+
+On macOS, install clang and AgentFS:
 
 ```sh
 xcode-select --install

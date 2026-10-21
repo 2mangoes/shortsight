@@ -1,6 +1,7 @@
 // Hold the graph and range cache behind a Unix socket.
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
+import { setTimeout as sleep } from "node:timers/promises";
 import { join, relative, sep } from "node:path";
 import { nestedProjects, projectFiles, type Project } from "../project.ts";
 import { createPaths } from "../paths.ts";
@@ -35,8 +36,8 @@ export async function runDaemon(project: Project): Promise<void> {
 	mkdirSync(paths.directory, { recursive: true });
 	// Held until this process exits, so only this daemon ever creates or removes the project's socket: a
 	// second one started beside it stops here.
-	if (!holdLock(paths.lock)) throw new Error("another server holds this project's lock");
-	if (process.env.SIGHTREAD_DAEMON_START_DELAY_MS) await Bun.sleep(duration("SIGHTREAD_DAEMON_START_DELAY_MS", 0));
+	if (!(await holdLock(paths.lock))) throw new Error("another server holds this project's lock");
+	if (process.env.SIGHTREAD_DAEMON_START_DELAY_MS) await sleep(duration("SIGHTREAD_DAEMON_START_DELAY_MS", 0));
 	const startedAt = Date.now();
 	const signature = await projectSignature(project);
 	const client = await startGraphClient(project, { stderr: 2, cacheDirectory: join(paths.directory, "ttsc-cache") });
@@ -113,8 +114,7 @@ export async function runDaemon(project: Project): Promise<void> {
 					value = message.quietOnly && active > 1 ? false : null;
 					stop = value !== false;
 					if (!stop) break;
-					if (process.env.SIGHTREAD_DAEMON_STOP_DELAY_MS)
-						await Bun.sleep(duration("SIGHTREAD_DAEMON_STOP_DELAY_MS", 0));
+					if (process.env.SIGHTREAD_DAEMON_STOP_DELAY_MS) await sleep(duration("SIGHTREAD_DAEMON_STOP_DELAY_MS", 0));
 					break;
 				case "help":
 					value = [
@@ -133,8 +133,7 @@ export async function runDaemon(project: Project): Promise<void> {
 					].toSorted((a, b) => a.type.localeCompare(b.type));
 					break;
 				case "query":
-					if (process.env.SIGHTREAD_DAEMON_QUERY_DELAY_MS)
-						await Bun.sleep(duration("SIGHTREAD_DAEMON_QUERY_DELAY_MS", 0));
+					if (process.env.SIGHTREAD_DAEMON_QUERY_DELAY_MS) await sleep(duration("SIGHTREAD_DAEMON_QUERY_DELAY_MS", 0));
 					value = await runQuery(
 						{
 							client,

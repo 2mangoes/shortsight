@@ -3,6 +3,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { API, type Snapshot } from "typescript/unstable/async";
 import { closeAPI, untilExit } from "./api.ts";
+import { parseJSONC } from "./runtime.ts";
 
 export interface Project {
 	/** Absolute directory containing the tsconfig. */
@@ -95,7 +96,7 @@ function hasTsconfig(directory: string): boolean {
 }
 
 function configReferences(file: string): string[] {
-	const value: unknown = Bun.JSONC.parse(readFileSync(file, "utf8"));
+	const value: unknown = parseJSONC(readFileSync(file, "utf8"));
 	if (!value || typeof value !== "object") return [];
 	const config = value as { files?: unknown; include?: unknown; references?: unknown };
 	if (!Array.isArray(config.references) || config.references.length === 0) return [];

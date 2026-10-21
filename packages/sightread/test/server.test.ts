@@ -35,6 +35,11 @@ const environment = [
 ] as const;
 const originals = new Map(environment.map((name) => [name, process.env[name]]));
 const runtime = mkdtempSync(join(realpathSync("/tmp"), "sr-"));
+// Node, to run sightread from source as Node users do: its own executable, not a version manager's shim in front of it,
+// so killing it kills Node.
+const node = Bun.spawnSync([Bun.which("node")!, "-p", "process.execPath"])
+	.stdout.toString()
+	.trim();
 process.env.XDG_RUNTIME_DIR = runtime;
 const component = [
 	"type Row<T> = { id: string; value: T };",
@@ -526,7 +531,7 @@ test("a cold start in one project does not block a warm query in another", async
 		return value;
 	});
 	try {
-		await until(async () => lockHeld(serverPaths(project(first.root)).lock));
+		await until(() => lockHeld(serverPaths(project(first.root)).lock));
 		const start = performance.now();
 		const output = await (await connect(project(second.root))).query(lookup("other"), {});
 		expect(output).toContain("other  exported function  src/other.ts:1-1");
@@ -647,16 +652,66 @@ await withStartLock(${JSON.stringify(path)}, async () => { console.log("held"); 
 	);
 	const reader = holder.stdout.getReader();
 	expect(new TextDecoder().decode((await reader.read()).value)).toContain("held");
-	expect(lockHeld(path)).toBe(true);
+	expect(await lockHeld(path)).toBe(true);
 	holder.kill("SIGKILL");
 	await holder.exited;
-	expect(lockHeld(path)).toBe(false);
+	expect(await lockHeld(path)).toBe(false);
 	let taken = false;
 	await withStartLock(path, async () => {
 		taken = true;
 	});
 	expect(taken).toBe(true);
 }, 30_000);
+
+test("a lock a Node process holds is seen and waited for under Bun, and freed when that process is killed", async () => {
+	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-node-lock-")), "start.lock");
+	const holder = Bun.spawn(
+		[
+			node,
+			"-e",
+			`const { withStartLock } = await import(${JSON.stringify(join(import.meta.dir, "../src/server/lock.ts"))});
+// A lock doesn't keep its holder running, so this does.
+setInterval(() => {}, 1_000);
+await withStartLock(${JSON.stringify(path)}, async () => { console.log("held"); await new Promise(() => {}); });`,
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const reader = holder.stdout.getReader();
+	expect(new TextDecoder().decode((await reader.read()).value)).toContain("held");
+	expect(await lockHeld(path)).toBe(true);
+	let taken = false;
+	const taking = withStartLock(path, async () => {
+		taken = true;
+	});
+	await Bun.sleep(300);
+	expect(taken).toBe(false);
+	// Killed, it leaves its socket behind, which the waiting taker removes.
+	holder.kill("SIGKILL");
+	await holder.exited;
+	await taking;
+	expect(taken).toBe(true);
+	expect(await lockHeld(path)).toBe(false);
+}, 30_000);
+
+test("a Node CLI and a Bun CLI starting together share one server", async () => {
+	await stopServer(project(first.root));
+	const request = JSON.stringify({ type: "lookup", query: "greet" });
+	const outputs = await Promise.all(
+		[node, process.execPath].map(async (executable) => {
+			const child = Bun.spawn([executable, join(import.meta.dir, "../src/cli.ts"), "--cwd", first.root, request], {
+				env: { ...Bun.env, XDG_RUNTIME_DIR: runtime },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return { code: await child.exited, out: await new Response(child.stdout).text() };
+		}),
+	);
+	for (const output of outputs) {
+		expect(output.code).toBe(0);
+		expect(output.out).toContain("greet  exported function  src/model.ts:1-1");
+	}
+	expect((await listServers()).filter(({ project: root }) => root === first.root)).toHaveLength(1);
+}, 45_000);
 
 test("a start lock held by a live process times out instead of waiting forever", async () => {
 	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-wait-")), "start.lock");

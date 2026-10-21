@@ -4,6 +4,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Project } from "../project.ts";
+import { parseJSONC, scriptExtension } from "../runtime.ts";
 
 const require = createRequire(import.meta.url);
 const names = [
@@ -21,7 +22,7 @@ const versions = ["@ttsc/graph", "ttsc", "typescript"].map((name) => [
 	(require(`${name}/package.json`) as { version: string }).version,
 ]);
 const ownVersion = (require("../../package.json") as { version: string }).version;
-const sourceRoot = join(import.meta.dir, "..");
+const sourceRoot = join(import.meta.dirname, "..");
 
 async function sourceFiles(directory: string, prefix = ""): Promise<Array<[string, number, number]>> {
 	const entries = await readdir(directory, { withFileTypes: true });
@@ -30,7 +31,7 @@ async function sourceFiles(directory: string, prefix = ""): Promise<Array<[strin
 			const name = join(prefix, entry.name);
 			const path = join(directory, entry.name);
 			if (entry.isDirectory()) return sourceFiles(path, name);
-			if (!entry.isFile() || !entry.name.endsWith(".ts")) return [];
+			if (!entry.isFile() || !entry.name.endsWith(scriptExtension)) return [];
 			const info = await stat(path);
 			return [[name, info.mtimeMs, info.size] as [string, number, number]];
 		}),
@@ -74,7 +75,7 @@ async function configChain(selected: string): Promise<Array<[string, number, num
 		seen.add(file);
 		const info = await stat(file);
 		files.push([file, info.mtimeMs, info.size]);
-		const value: unknown = Bun.JSONC.parse(await readFile(file, "utf8"));
+		const value: unknown = parseJSONC(await readFile(file, "utf8"));
 		if (!value || typeof value !== "object" || !("extends" in value)) return;
 		const extension = (value as { extends?: unknown }).extends;
 		const parents =

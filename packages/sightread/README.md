@@ -6,7 +6,7 @@
 
 ## Install
 
-Install [Bun](https://bun.sh) 1.4 or later, then `sightread`:
+It runs on [Node](https://nodejs.org) 22 or later, or [Bun](https://bun.sh) 1.4 or later:
 
 ```sh
 npm i -g sightread

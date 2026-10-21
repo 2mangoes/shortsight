@@ -4,6 +4,7 @@ import { open, readdir } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import type { Project } from "../project.ts";
+import { scriptExtension } from "../runtime.ts";
 import type { RequestType } from "../upstream.ts";
 import { lockHeld, withStartLock } from "./lock.ts";
 import { serverPaths, serverPathsIn, stateParent, type ServerPaths } from "./paths.ts";
@@ -42,11 +43,10 @@ interface Response {
 }
 
 export class ServerRequestError extends Error {
-	constructor(
-		message: string,
-		readonly full: boolean,
-	) {
+	readonly full: boolean;
+	constructor(message: string, full: boolean) {
 		super(message);
+		this.full = full;
 	}
 }
 
@@ -110,8 +110,8 @@ async function ping(paths: ServerPaths): Promise<Ping | undefined> {
 
 // Whether the project's daemon, which holds its lock until it exits, is gone within five seconds.
 async function gone(paths: ServerPaths): Promise<boolean> {
-	for (let index = 0; index < 50 && lockHeld(paths.lock); index++) await pause(100);
-	return !lockHeld(paths.lock);
+	for (let index = 0; index < 50 && (await lockHeld(paths.lock)); index++) await pause(100);
+	return !(await lockHeld(paths.lock));
 }
 
 // Stop a project's server. One that holds its lock without answering, past the moment it takes to finish stopping, is
@@ -169,7 +169,7 @@ async function evictQuiet(current: string): Promise<void> {
 		const live = await ping(paths);
 		if (live) servers.push({ paths, lastUsed: live.lastUsed, active: live.active });
 		// One that holds its lock but doesn't answer yet is starting.
-		else if (lockHeld(paths.lock)) starting++;
+		else if (await lockHeld(paths.lock)) starting++;
 	}
 	const need = Math.max(0, servers.length + starting - maximum + 1);
 	const idle = servers.filter((server) => server.active === 0 && Date.now() - server.lastUsed >= quiet);
@@ -184,7 +184,7 @@ async function answer(paths: ServerPaths, signature: string, child?: ChildProces
 	while (Date.now() < deadline) {
 		const live = await ping(paths);
 		if (live?.signature === signature) return live;
-		if (!lockHeld(paths.lock) && (!child || exited(child))) return undefined;
+		if (!(await lockHeld(paths.lock)) && (!child || exited(child))) return undefined;
 		await pause(100);
 	}
 	return undefined;
@@ -194,13 +194,13 @@ async function start(paths: ServerPaths, project: Project, signature: string): P
 	announceStart?.(project);
 	// Starts are counted against the limit once their daemons hold their locks, so each waits for that before the
 	// next start counts.
-	const daemon = await withStartLock(join(paths.parent, "starting.lock"), async () => {
+	const daemon = await withStartLock(join(paths.parent, "client.lock"), async () => {
 		await evictQuiet(paths.directory);
 		const log = await open(paths.log, "a");
 		try {
 			const child = spawn(
 				process.execPath,
-				[join(import.meta.dir, "../cli.ts"), "--daemon", project.root, project.tsconfig],
+				[join(import.meta.dirname, `../cli${scriptExtension}`), "--daemon", project.root, project.tsconfig],
 				{
 					cwd: project.root,
 					detached: true,
@@ -213,7 +213,7 @@ async function start(paths: ServerPaths, project: Project, signature: string): P
 			});
 			child.unref();
 			const until = Date.now() + 10_000;
-			while (!exited(child) && !lockHeld(paths.lock) && Date.now() < until) await pause(25);
+			while (!exited(child) && !(await lockHeld(paths.lock)) && Date.now() < until) await pause(25);
 			return child;
 		} finally {
 			await log.close();
@@ -259,7 +259,7 @@ export async function connect(project: Project): Promise<ServerConnection> {
 		const found = await ping(paths);
 		if (matches(found)) return found!;
 		if (found) await stopAt(paths);
-		else if (lockHeld(paths.lock)) {
+		else if (await lockHeld(paths.lock)) {
 			// One that holds the lock without answering is starting, as one whose client was stopped, or stopping.
 			const answered = await answer(paths, signature);
 			if (answered) return answered;

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 // Parse the sightread command and route requests to a project daemon.
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -148,7 +148,7 @@ async function main(args: string[]): Promise<string> {
 		throw new Error("usage: sightread [--cwd DIR] [--in DIR] [--json | --raw] '<JSON request or array>'");
 	if (positionals.length === 1 && ["--help", "-h"].includes(positionals[0])) return showHelp(cwd);
 	if (positionals.length === 1 && positionals[0] === "--skill")
-		return readFile(join(import.meta.dir, "../skills/sightread/SKILL.md"), "utf8");
+		return readFile(join(import.meta.dirname, "../skills/sightread/SKILL.md"), "utf8");
 	if (positionals[0] === "ps" && positionals.length === 1) {
 		return (await listServers())
 			.map(({ pid, project, lastUsed }) => `${pid}\t${project}\t${new Date(lastUsed).toISOString()}`)

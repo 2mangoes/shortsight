@@ -10,7 +10,7 @@ export interface ServerPaths {
 	directory: string;
 	socket: string;
 	log: string;
-	/** Held by the project's daemon for as long as it runs. */
+	/** Held by the project's daemon for as long as it runs. Like every lock, a socket, so no longer than `socket`. */
 	lock: string;
 	/** Held by a client while it starts or stops the daemon. */
 	start: string;
@@ -68,7 +68,7 @@ export function serverPathsIn(directory: string): ServerPaths {
 		directory,
 		socket: join(directory, "server.sock"),
 		log: join(directory, "server.log"),
-		lock: join(directory, "server.lock"),
-		start: join(directory, "starting.lock"),
+		lock: join(directory, "daemon.lock"),
+		start: join(directory, "client.lock"),
 	};
 }
