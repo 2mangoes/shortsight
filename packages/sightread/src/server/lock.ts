@@ -21,21 +21,25 @@ const holder = (directory: string) =>
 
 // Remove a dead holder's lock, one reclaimer at a time. Two that both saw it dead would otherwise race: the second
 // could remove the lock the first has just taken. Under the guard, the holder is checked again before removal. A
-// guard older than a few seconds was left by a reclaimer that died, and is removed in turn. Returns whether it ran.
+// guard is removed in turn only once its own reclaimer is dead, whatever its age, or if after a few seconds it still
+// names none, since one that died before writing its pid can't. Returns whether it ran.
 async function reclaim(directory: string): Promise<boolean> {
 	const guard = `${directory}.reclaim`;
 	try {
 		await mkdir(guard);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		const reclaimer = await holder(guard);
 		const age = await stat(guard).then(
 			(found) => Date.now() - found.mtimeMs,
 			() => 0,
 		);
-		if (age > 5_000) await rm(guard, { recursive: true, force: true });
+		if ((reclaimer > 0 && !running(reclaimer)) || (reclaimer === 0 && age > 5_000))
+			await rm(guard, { recursive: true, force: true });
 		return false;
 	}
 	try {
+		await writeFile(join(guard, "pid"), String(process.pid));
 		const pid = await holder(directory);
 		const held = await stat(directory).catch(() => undefined);
 		if (held && ((pid > 0 && !running(pid)) || (pid === 0 && Date.now() - held.mtimeMs > 1_000)))

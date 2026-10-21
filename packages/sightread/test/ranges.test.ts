@@ -370,3 +370,28 @@ test("evicts the oldest cached file after maxFiles", async () => {
 		await index.close();
 	}
 });
+
+test("a parse in flight when its process dies fails instead of waiting forever, and close returns", async () => {
+	const parser = createDeclarationParser();
+	try {
+		expect((await parser.parse("first.ts", "export const First = 1;"))[0]?.name).toBe("First");
+		// The parser's own process: the newest TypeScript API process this one has started.
+		const pid = Number(
+			Bun.spawnSync(["pgrep", "-n", "-P", String(process.pid), "-f", "__sightread_ranges_"])
+				.stdout.toString()
+				.trim(),
+		);
+		expect(pid).toBeGreaterThan(0);
+		// It stops answering, then dies with the next parse in flight.
+		process.kill(pid, "SIGSTOP");
+		const pending = parser.parse("second.ts", "export const Second = 2;").then(
+			() => "parsed",
+			(error: Error) => error.message,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		process.kill(pid, "SIGKILL");
+		expect(await pending).toBe("TypeScript parser process exited");
+	} finally {
+		await parser.close();
+	}
+}, 15_000);

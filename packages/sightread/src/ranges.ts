@@ -6,6 +6,7 @@ import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
 import type { Node, SourceFile } from "typescript/unstable/ast";
 import type { FileSystem } from "typescript/unstable/fs";
+import { APIExitError, processOf, untilExit } from "./api.ts";
 import { toHandle } from "./model.ts";
 import { graphKind, indexDeclarations, type DeclarationKind, type Unindexed } from "./naming.ts";
 
@@ -97,46 +98,56 @@ export function createDeclarationParser(): DeclarationParser {
 				exited = false;
 				throw new Error("TypeScript parser process exited");
 			}
-			// Each parse gets a new virtual file. TypeScript can keep serving an open file's first contents
-			// after a change, so reusing one file per extension returned earlier files' declarations.
-			const file = `${root}/source${++parsed}${extname(fileName) || ".ts"}`;
-			const replaced = previous;
-			if (replaced) files.delete(replaced);
-			files.set(file, text);
-			const snapshot = await api.updateSnapshot({
-				...(configured ? {} : { openProjects: [config] }),
-				openFiles: [file],
-				...(replaced ? { closeFiles: [replaced] } : {}),
-				fileChanges: { created: [file], ...(replaced ? { deleted: [replaced] } : {}) },
+			// The process can exit under a parse in flight too, which the API would leave waiting forever.
+			return untilExit(api, parseWith(api, fileName, text)).catch((error: unknown) => {
+				if (!(error instanceof APIExitError)) throw error;
+				exited = true;
+				throw new Error("TypeScript parser process exited");
 			});
-			previous = file;
-			const child = (api as unknown as { client: { process?: ChildProcess } }).client.process;
-			if (child && child !== watched) {
-				watched = child;
-				child.once("exit", () => {
-					exited = true;
-				});
-			}
-			api.clearSourceFileCache();
-			configured = true;
-			try {
-				const project = await snapshot.getDefaultProjectForFile(file);
-				const sourceFile = await project?.program.getSourceFile(file);
-				return sourceFile ? collectDeclarations(sourceFile) : [];
-			} finally {
-				await snapshot.dispose();
-			}
 		});
 		sequence = task.catch(() => undefined);
 		return task;
+	};
+
+	const parseWith = async (current: API, fileName: string, text: string): Promise<Declaration[]> => {
+		// Each parse gets a new virtual file. TypeScript can keep serving an open file's first contents
+		// after a change, so reusing one file per extension returned earlier files' declarations.
+		const file = `${root}/source${++parsed}${extname(fileName) || ".ts"}`;
+		const replaced = previous;
+		if (replaced) files.delete(replaced);
+		files.set(file, text);
+		const snapshot = await current.updateSnapshot({
+			...(configured ? {} : { openProjects: [config] }),
+			openFiles: [file],
+			...(replaced ? { closeFiles: [replaced] } : {}),
+			fileChanges: { created: [file], ...(replaced ? { deleted: [replaced] } : {}) },
+		});
+		previous = file;
+		const child = processOf(current);
+		if (child && child !== watched) {
+			watched = child;
+			child.once("exit", () => {
+				exited = true;
+			});
+		}
+		current.clearSourceFileCache();
+		configured = true;
+		try {
+			const project = await snapshot.getDefaultProjectForFile(file);
+			const sourceFile = await project?.program.getSourceFile(file);
+			return sourceFile ? collectDeclarations(sourceFile) : [];
+		} finally {
+			await snapshot.dispose();
+		}
 	};
 
 	return {
 		parse,
 		async close() {
 			closed = true;
-			await sequence;
+			// Closed first, so a parse waiting on a process that has stopped answering is released.
 			await api.close();
+			await sequence;
 		},
 	};
 }

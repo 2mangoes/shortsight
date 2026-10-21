@@ -116,7 +116,8 @@ function utf16Column(line: string, byteColumn: number): number | undefined {
 	return bytes === byteColumn - 1 ? units + 1 : undefined;
 }
 
-async function evidenceLines(value: unknown, root: string): Promise<Map<string, string[]>> {
+// Evidence names files relative to the project; any in the repository can be read, a sibling package's included.
+async function evidenceLines(value: unknown, root: string, boundary = root): Promise<Map<string, string[]>> {
 	const files = new Set<string>();
 	const collect = (nested: unknown): void => {
 		if (Array.isArray(nested)) return nested.forEach(collect);
@@ -138,7 +139,7 @@ async function evidenceLines(value: unknown, root: string): Promise<Map<string, 
 	const contents = await Promise.all(
 		[...files].map(async (file): Promise<[string, string[]] | undefined> => {
 			const absolute = resolve(root, file);
-			const path = relative(root, absolute);
+			const path = relative(boundary, absolute);
 			if (!path || path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path)) return undefined;
 			try {
 				return [file, (await readFile(absolute, "utf8")).split(/\r\n|\n|\r/)];
@@ -188,6 +189,12 @@ function truncated(value: unknown): boolean {
 	const item = object(value);
 	return item ? item.truncated === true || Object.values(item).some(truncated) : false;
 }
+
+// The graph says it cut a class's, an interface's or an enum's members to memberLimit only in its audit text.
+const membersCut = (value: unknown) => {
+	const audit = object(value)?.audit;
+	return typeof audit === "string" && audit.includes("member list was cut");
+};
 
 /** The graph stops an open walk at this many hops per symbol it may return, as well as at the symbols themselves. */
 export const HOPS_PER_NODE = 2;
@@ -265,7 +272,7 @@ export async function normalizeResult(
 	paths?: PathMapper,
 ): Promise<GraphResult> {
 	const root = object(object(upstreamValue)?.result) ?? object(upstreamValue) ?? {};
-	const linesByFile = await evidenceLines(root, paths?.project ?? process.cwd());
+	const linesByFile = await evidenceLines(root, paths?.project ?? process.cwd(), paths?.repository);
 	const type = typeof root.type === "string" ? root.type : String(request.type ?? "result");
 	const nodes = new Map<string, GraphNode>();
 	const edges: GraphEdge[] = [];
@@ -525,7 +532,7 @@ export async function normalizeResult(
 		type,
 		shown,
 		...(total === undefined ? {} : { total }),
-		...(truncated(root) || membersCapped ? { raise: `${type}.${limit}` } : {}),
+		...(truncated(root) || membersCapped || membersCut(upstreamValue) ? { raise: `${type}.${limit}` } : {}),
 		nodes: sorted,
 		edges,
 		sections,

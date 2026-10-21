@@ -1,5 +1,5 @@
 // Find or start a project daemon and exchange one JSON message per socket connection.
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { open, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -90,26 +90,48 @@ export function exchange(socketPath: string, message: object, timeout = 120_000)
 	});
 }
 
-async function ping(paths: ServerPaths): Promise<Ping | undefined> {
+// Whether a server answers at a socket: it does, nothing is there, or something is there but doesn't answer, which
+// can be a live server that's stuck.
+type Probe = { live: Ping } | { absent: true } | { unresponsive: true };
+async function probe(paths: ServerPaths): Promise<Probe> {
 	try {
 		const response = await exchange(paths.socket, { type: "ping" }, 1_000);
-		if (!response || typeof response !== "object" || !("pid" in response)) return undefined;
-		return response as Ping;
-	} catch {
-		return undefined;
+		if (!response || typeof response !== "object" || !("pid" in response)) return { absent: true };
+		return { live: response as Ping };
+	} catch (error) {
+		return error instanceof SocketTimeoutError ? { unresponsive: true } : { absent: true };
 	}
 }
 
+async function ping(paths: ServerPaths): Promise<Ping | undefined> {
+	const found = await probe(paths);
+	return "live" in found ? found.live : undefined;
+}
+
+// The process a server's state names, when it's still running.
+const stateOwner = async (paths: ServerPaths) => {
+	const state = await readFile(paths.state, "utf8")
+		.then((text) => JSON.parse(text) as { pid?: number })
+		.catch(() => undefined);
+	return state?.pid && pidAlive(state.pid) ? state.pid : undefined;
+};
+
+// Stop a project's server and remove its files, but only once it has gone: a server that doesn't answer, while the
+// process its state names still runs, is reported rather than treated as stopped, so a second can't start beside it.
 async function stopAt(paths: ServerPaths, quietOnly = false): Promise<void> {
-	if (await ping(paths)) {
+	const found = await probe(paths);
+	if ("unresponsive" in found && (await stateOwner(paths)))
+		throw new ServerStopError(`server is not responding; see ${paths.log}`);
+	if ("live" in found) {
 		try {
 			if ((await exchange(paths.socket, { type: "stop", quietOnly }, 5_000)) === false) return;
 		} catch (error) {
 			if (error instanceof SocketTimeoutError) throw new ServerStopError(`server did not stop; see ${paths.log}`);
 			/* It may have exited already. */
 		}
-		for (let index = 0; index < 50 && (await ping(paths)); index++) await pause(100);
-		if (await ping(paths)) throw new ServerStopError(`server did not stop; see ${paths.log}`);
+		// Gone means its process has exited, not that it stopped answering.
+		for (let index = 0; index < 50 && pidAlive(found.live.pid); index++) await pause(100);
+		if (pidAlive(found.live.pid)) throw new ServerStopError(`server did not stop; see ${paths.log}`);
 	}
 	await unlink(paths.socket).catch(() => undefined);
 	await unlink(paths.state).catch(() => undefined);
@@ -233,6 +255,7 @@ async function start(paths: ServerPaths, project: Project, signature: string): P
 	});
 	await rm(paths.socket, { force: true });
 	const log = await open(paths.log, "a");
+	let spawned: ChildProcess;
 	try {
 		const child = spawn(
 			process.execPath,
@@ -248,16 +271,34 @@ async function start(paths: ServerPaths, project: Project, signature: string): P
 			child.once("spawn", resolve);
 		});
 		child.unref();
+		spawned = child;
 	} finally {
 		await log.close();
 	}
-	const attempts = process.env.SIGHTREAD_DAEMON_FAIL === "1" ? 5 : 300;
-	for (let index = 0; index < attempts; index++) {
+	const exited = () => spawned.exitCode !== null || spawned.signalCode !== null;
+	// Wait until a deadline, not for a number of pings, each of which can take a second; and no longer once the daemon
+	// has exited.
+	const deadline =
+		Date.now() +
+		(process.env.SIGHTREAD_DAEMON_FAIL === "1" ? 500 : Number(process.env.SIGHTREAD_START_TIMEOUT_MS) || startTimeout);
+	while (Date.now() < deadline && !exited()) {
 		const live = await ping(paths);
 		if (live?.signature === signature) return live;
 		await pause(100);
 	}
-	await unlink(paths.state).catch(() => undefined);
+	// It didn't start: stop it and what it started, so it can't take the socket after this gives up its place.
+	if (!exited() && spawned.pid) {
+		try {
+			process.kill(-spawned.pid, "SIGKILL");
+		} catch {
+			/* Already gone. */
+		}
+		for (let index = 0; index < 50 && pidAlive(spawned.pid); index++) await pause(100);
+	}
+	const owner = await readFile(paths.state, "utf8")
+		.then((text) => (JSON.parse(text) as { pid?: number }).pid)
+		.catch(() => undefined);
+	if (owner === process.pid || owner === spawned.pid) await unlink(paths.state).catch(() => undefined);
 	throw new Error(`server did not start; see ${paths.log}`);
 }
 

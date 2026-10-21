@@ -923,3 +923,17 @@ test("a sibling package's file the project imports is diffed, with callers in ot
 		"lib/shared.ts\n  1-3  shared  edited\n  └─ called by other/use.ts:2-4  viaOther\n     └─ called by client/src/app.ts:2-2  app",
 	);
 }, 30_000);
+
+test("callers the graph leaves out through a dispatch to 12 or more implementations are noted", async () => {
+	const implementations = Array.from({ length: 12 }, (_, index) => index);
+	const f = fixture({
+		"client/src/shape.ts": `export interface Shape {\n\tarea(): number;\n}\n${implementations
+			.map((index) => `export class Shape${index} implements Shape {\n\tarea() {\n\t\treturn ${index};\n\t}\n}\n`)
+			.join("")}`,
+		"client/src/use.ts":
+			'import type { Shape } from "./shape.ts";\nexport function total(shape: Shape) {\n\treturn shape.area();\n}\n',
+	});
+	const changed = (await Bun.file(join(f.root, "src/shape.ts")).text()).replace("return 3;", "return 33;");
+	f.put("client/src/shape.ts", changed);
+	expect(await f.run()).toContain("Shape3.area: callers through a dispatch to 12 or more implementations left out");
+}, 30_000);

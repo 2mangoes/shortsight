@@ -36,7 +36,7 @@ export function formatDiffNotes(notes: string[]): string[] {
 	let extraNonTs = 0;
 	let extraOutside = 0;
 	for (const note of notes) {
-		const truncation = note.match(/^(.+): impact truncated at \d+ callers; reverse trace used$/);
+		const truncation = note.match(/^(.+): impact truncated at \d+ (?:callers|hops); reverse trace used$/);
 		if (note.startsWith("no default branch found")) groups[0].unshift(note);
 		else if (truncation) truncated.push(truncation[1]);
 		else if (note.endsWith(": not TypeScript")) nonTs.push(note.slice(0, -": not TypeScript".length));

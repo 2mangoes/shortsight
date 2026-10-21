@@ -352,3 +352,53 @@ test("in a nested project, a resolved name keeps the graph's handle, though the 
 		rmSync(repository, { recursive: true, force: true });
 	}
 });
+
+test("evidence from a sibling package's file keeps its columns", async () => {
+	const repository = mkdtempSync(join(realpathSync("/tmp"), "sr-sibling-evidence-"));
+	try {
+		mkdirSync(join(repository, "app/src"), { recursive: true });
+		mkdirSync(join(repository, "lib"), { recursive: true });
+		writeFileSync(
+			join(repository, "lib/shared.ts"),
+			"export function shared() { return 1; }\nexport const use = () => shared();\n",
+		);
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const model = await normalizeResult(
+			{ type: "trace", from: "a", direction: "reverse" },
+			{
+				result: {
+					type: "trace",
+					start: {
+						id: "../../lib/shared.ts#shared:function",
+						name: "shared",
+						kind: "function",
+						file: "../../lib/shared.ts",
+						line: 1,
+					},
+					reached: [
+						{
+							id: "../../lib/shared.ts#use:variable",
+							name: "use",
+							kind: "variable",
+							file: "../../lib/shared.ts",
+							line: 2,
+						},
+					],
+					hops: [
+						{
+							from: "../../lib/shared.ts#use:variable",
+							to: "../../lib/shared.ts#shared:function",
+							kind: "calls",
+							evidence: { file: "../../lib/shared.ts", startLine: 2, startCol: 20, endLine: 2, endCol: 26 },
+						},
+					],
+				},
+			},
+			ranges,
+			createPaths(join(repository, "app/src")),
+		);
+		expect(model.edges[0]?.at).toEqual(expect.objectContaining({ line: 2, col: 20, endCol: 26 }));
+	} finally {
+		rmSync(repository, { recursive: true, force: true });
+	}
+});

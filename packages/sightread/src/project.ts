@@ -2,6 +2,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { API, type Snapshot } from "typescript/unstable/async";
+import { untilExit } from "./api.ts";
 
 export interface Project {
 	/** Absolute directory containing the tsconfig. */
@@ -18,7 +19,7 @@ const skipped = new Set([".llm-ephemeral", "node_modules", ".bare", ".git", "dis
 export async function projectFiles(project: Project, shared?: API): Promise<Set<string>> {
 	const api = shared ?? new API({ cwd: project.root });
 	try {
-		const parsed = await api.parseConfigFile(project.tsconfig);
+		const parsed = await untilExit(api, api.parseConfigFile(project.tsconfig));
 		return new Set(
 			parsed.fileNames
 				.filter((name) => /\.(?:ts|tsx|mts|cts)$/.test(name) && !/\.d\.(?:ts|mts|cts)$/.test(name))
@@ -42,12 +43,17 @@ export async function sourceFileNames(snapshot: Snapshot): Promise<Set<string>> 
 export async function programFiles(project: Project): Promise<Set<string>> {
 	const api = new API({ cwd: project.root });
 	try {
-		const snapshot = await api.updateSnapshot({ openProjects: [project.tsconfig] });
-		try {
-			return await sourceFileNames(snapshot);
-		} finally {
-			await snapshot.dispose();
-		}
+		return await untilExit(
+			api,
+			(async () => {
+				const snapshot = await api.updateSnapshot({ openProjects: [project.tsconfig] });
+				try {
+					return await sourceFileNames(snapshot);
+				} finally {
+					await snapshot.dispose();
+				}
+			})(),
+		);
 	} finally {
 		await api.close();
 	}
@@ -133,7 +139,7 @@ async function chosenConfig(solution: string, cwd: string): Promise<string> {
 		let bestContains = false;
 		let bestCount = -1;
 		for (const file of leaves) {
-			const parsed = await api.parseConfigFile(file);
+			const parsed = await untilExit(api, api.parseConfigFile(file));
 			const files = parsed.fileNames.filter(
 				(name) => /\.(?:ts|tsx|mts|cts)$/.test(name) && !/\.d\.(?:ts|mts|cts)$/.test(name),
 			);

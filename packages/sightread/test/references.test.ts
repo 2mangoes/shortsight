@@ -705,3 +705,31 @@ test("references see a file an import names once it exists", () => {
 		runIn(project, "stop");
 	}
 });
+
+test("references see a file an import names in a directory that held none", () => {
+	const project = join(repository, "new-import-sub");
+	mkdirSync(join(project, "lib"), { recursive: true });
+	writeFileSync(
+		join(project, "tsconfig.json"),
+		'{"compilerOptions":{"strict":true,"module":"nodenext"},"files":["main.ts"]}\n',
+	);
+	writeFileSync(join(project, "main.ts"), 'import "./lib/extra.js";\nexport function target() { return 1; }\n');
+	const users = () =>
+		(
+			JSON.parse(
+				runIn(project, "--json", JSON.stringify({ type: "references", symbol: "main.ts#target:function" })).out,
+			) as Array<{
+				nodes: Array<{ file: string }>;
+			}>
+		)[0]!.nodes.map(({ file }) => file);
+	try {
+		expect(users()).toEqual([]);
+		writeFileSync(
+			join(project, "lib/extra.ts"),
+			'import { target } from "../main.js";\nexport const extra = () => target();\n',
+		);
+		expect(users()).toContain("lib/extra.ts");
+	} finally {
+		runIn(project, "stop");
+	}
+});

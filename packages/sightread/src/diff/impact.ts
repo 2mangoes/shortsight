@@ -3,7 +3,8 @@ import { readFile, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
-import { fromHandle, object, traceCut, type GraphNode } from "../model.ts";
+import { untilExit } from "../api.ts";
+import { fromHandle, HOPS_PER_NODE, object, traceCut, type GraphNode } from "../model.ts";
 import type { Project } from "../project.ts";
 import { handleFor, indexedDeclarations, type Declaration, type DeclarationParser } from "../ranges.ts";
 import { connect, type ServerConnection } from "../server/client.ts";
@@ -66,7 +67,7 @@ interface ImportPaths {
 async function importPaths(project: Project): Promise<ImportPaths> {
 	const api = new API({ cwd: project.root });
 	try {
-		const { options } = await api.parseConfigFile(project.tsconfig);
+		const { options } = await untilExit(api, api.parseConfigFile(project.tsconfig));
 		const paths = options.paths;
 		return {
 			root: project.root,
@@ -377,11 +378,20 @@ async function graphChains(input: {
 			continue;
 		}
 		let edges = edgesOf(value);
-		if (capped(value)) {
-			notes.push(`${item.node.name}: impact truncated at ${IMPACT_LIMIT} callers; reverse trace used`);
+		const cut = traceCut(result(value), IMPACT_LIMIT, 3);
+		if (cut === "maxNodes") {
+			const hops = edgesOf(value).length >= IMPACT_LIMIT * HOPS_PER_NODE;
+			notes.push(
+				`${item.node.name}: impact truncated at ${hops ? `${IMPACT_LIMIT * HOPS_PER_NODE} hops` : `${IMPACT_LIMIT} callers`}; reverse trace used`,
+			);
 			value = reverseByIndex.get(index);
 			edges = [...edges, ...edgesOf(value)];
+			if (traceCut(result(value), REVERSE_LIMIT, 3) === "maxNodes")
+				notes.push(`${item.node.name}: callers truncated at ${REVERSE_LIMIT} in the reverse trace too`);
 		}
+		// The graph leaves out a dispatch to 12 or more implementations, so callers through it aren't shown.
+		if (cut === "complete")
+			notes.push(`${item.node.name}: callers through a dispatch to 12 or more implementations left out`);
 		const incoming = incomingEdges(item, edges, testMap);
 		await recordChains(findChains(item, incoming, changedHandles), nodeFor, callerMap, chains);
 	}

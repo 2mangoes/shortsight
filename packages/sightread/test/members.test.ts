@@ -233,6 +233,13 @@ test("details lists a type alias's members and qualifies an object literal's, an
 		memberLimit: 1,
 	});
 	expect([limited.sections.members.length, limited.raise]).toEqual([1, "details.memberLimit"]);
+	// So does the graph's own member list, an enum's here.
+	const enumLimited = query<{ sections: { members: string[] }; raise?: string }>({
+		type: "details",
+		handles: ["Color"],
+		memberLimit: 1,
+	});
+	expect([enumLimited.sections.members.length, enumLimited.raise]).toEqual([1, "details.memberLimit"]);
 	const member = (handle: string) =>
 		query<{ nodes: Array<{ handle: string }>; note?: string }>({ type: "details", handles: [handle] });
 	expect(member("Lit.lprop").nodes.map(({ handle }) => handle)).toEqual(["src/decl.ts#Lit.lprop:variable"]);

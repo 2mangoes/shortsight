@@ -34,6 +34,7 @@ const environment = [
 	"SIGHTREAD_DAEMON_QUERY_DELAY_MS",
 	"SIGHTREAD_DAEMON_STOP_DELAY_MS",
 	"SIGHTREAD_DAEMON_STATE_DELAY_MS",
+	"SIGHTREAD_START_TIMEOUT_MS",
 	"SIGHTREAD_DAEMON_SOCKET_ERROR_ON_RESET",
 ] as const;
 const originals = new Map(environment.map((name) => [name, process.env[name]]));
@@ -727,5 +728,74 @@ test("a state write still in flight when a daemon stops doesn't replace a replac
 		}
 	} finally {
 		delete process.env.SIGHTREAD_DAEMON_STATE_DELAY_MS;
+	}
+}, 45_000);
+
+test("a reclaimer's guard isn't taken from it while it lives, however old", async () => {
+	const directory = join(mkdtempSync(join(realpathSync("/tmp"), "sr-guard-")), "start.lock");
+	mkdirSync(directory);
+	writeFileSync(join(directory, "pid"), "2147483646");
+	// A live reclaimer's guard, written long ago.
+	const guard = `${directory}.reclaim`;
+	mkdirSync(guard);
+	writeFileSync(join(guard, "pid"), String(process.pid));
+	const old = new Date(Date.now() - 60_000);
+	utimesSync(guard, old, old);
+	let held = false;
+	const taking = withStartLock(directory, async () => {
+		held = true;
+	});
+	await new Promise((resolve) => setTimeout(resolve, 400));
+	expect([held, existsSync(guard)]).toEqual([false, true]);
+	rmSync(guard, { recursive: true, force: true });
+	await taking;
+	expect(held).toBe(true);
+});
+
+test("stopping a server that has stopped answering fails, and leaves its files", async () => {
+	await stopAllServers();
+	const current = project(first.root);
+	const paths = serverPaths(current);
+	const stuck = await connect(current);
+	process.kill(stuck.pid, "SIGSTOP");
+	try {
+		expect(
+			await stopServer(current).then(
+				() => "stopped",
+				(error: Error) => error.message,
+			),
+		).toBe(`server is not responding; see ${paths.log}`);
+		expect([existsSync(paths.socket), existsSync(paths.state)]).toEqual([true, true]);
+	} finally {
+		process.kill(stuck.pid, "SIGCONT");
+		await stopServer(current);
+	}
+}, 45_000);
+
+test("a server that doesn't start in time is stopped, not left to take the socket later", async () => {
+	await stopAllServers();
+	const disposable = fixture({ "src/late.ts": "export function late() { return 1; }\n" });
+	const current = project(disposable.root);
+	const paths = serverPaths(current);
+	// A daemon slower to start than the client waits for.
+	process.env.SIGHTREAD_START_TIMEOUT_MS = "500";
+	process.env.SIGHTREAD_DAEMON_START_DELAY_MS = "3000";
+	try {
+		expect(
+			await connect(current).then(
+				() => "started",
+				(error: Error) => error.message,
+			),
+		).toBe(`server did not start; see ${paths.log}`);
+		// Past the delay it would have started after.
+		await new Promise((resolve) => setTimeout(resolve, 8_000));
+		expect([
+			existsSync(paths.socket),
+			(await listServers()).some(({ project: root }) => root === current.root),
+		]).toEqual([false, false]);
+	} finally {
+		delete process.env.SIGHTREAD_START_TIMEOUT_MS;
+		delete process.env.SIGHTREAD_DAEMON_START_DELAY_MS;
+		disposable.cleanup();
 	}
 }, 45_000);

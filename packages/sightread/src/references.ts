@@ -18,6 +18,7 @@ import {
 } from "typescript/unstable/ast";
 import { fromHandle, toHandle, type GraphNode, type GraphResult } from "./model.ts";
 import type { PathMapper } from "./paths.ts";
+import { APIExitError, untilExit } from "./api.ts";
 import { projectFiles, sourceFileNames, type Project } from "./project.ts";
 import {
 	graphKind,
@@ -157,6 +158,16 @@ async function listing(directory: string): Promise<Listing | undefined> {
 	return { stamp: found.mtimeMs, entries: new Set(entries) };
 }
 
+// Every directory under one, outside node_modules and hidden ones, itself included.
+async function directoriesUnder(directory: string): Promise<string[]> {
+	const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+	const found = [directory];
+	for (const entry of entries)
+		if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith("."))
+			found.push(...(await directoriesUnder(join(directory, entry.name))));
+	return found;
+}
+
 // Every source file under a directory that has just appeared, outside node_modules.
 async function sourcesUnder(directory: string): Promise<string[]> {
 	const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
@@ -172,11 +183,12 @@ async function sourcesUnder(directory: string): Promise<string[]> {
 
 /** Keep one TypeScript language service for a daemon's lifetime, brought up to date before each query. */
 export function createReferenceIndex(project: Project): ReferenceIndex {
-	const api = new API({ cwd: project.root });
+	let api = new API({ cwd: project.root });
 	const stamps = new Map<string, string>();
 	// Files the program loaded that have since gone, so their return is seen as a new file.
 	const missing = new Set<string>();
-	// The directories of the files the program loads, so a file an import couldn't resolve to is seen when it appears.
+	// The directories of the files the program loads, and those under them, so a file an import couldn't resolve to is
+	// seen when it appears, in a directory that already held one or one that didn't.
 	const listings = new Map<string, Listing>();
 	const appeared = async (): Promise<string[]> => {
 		const found: string[] = [];
@@ -229,10 +241,12 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		for (const [file, stamp] of [...current, ...added])
 			if (roots.has(file) || loaded.has(file)) stamps.set(file, stamp);
 		for (const directory of new Set([...roots, ...loaded].map((file) => dirname(file))))
-			if (!listings.has(directory)) {
-				const found = await listing(directory);
-				if (found) listings.set(directory, found);
-			}
+			if (!listings.has(directory))
+				for (const under of await directoriesUnder(directory))
+					if (!listings.has(under)) {
+						const found = await listing(under);
+						if (found) listings.set(under, found);
+					}
 		if (previous) {
 			api.clearSourceFileCache();
 			await previous.dispose();
@@ -240,8 +254,21 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		return snapshot;
 	};
 
+	// One query at a time. A process that exits under one would leave it waiting forever, so each is raced against
+	// that, and the next query starts a new process from nothing.
 	const serially = <T>(task: () => Promise<T>): Promise<T> => {
-		const result = sequence.then(task);
+		const result = sequence.then(() =>
+			untilExit(api, task()).catch((error: unknown) => {
+				if (error instanceof APIExitError && !closed) {
+					api = new API({ cwd: project.root });
+					snapshot = undefined;
+					stamps.clear();
+					missing.clear();
+					listings.clear();
+				}
+				throw error;
+			}),
+		);
 		sequence = result.catch(() => undefined);
 		return result;
 	};
@@ -417,11 +444,11 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 				}
 				return undefined;
 			}),
-		close: () =>
-			serially(async () => {
-				closed = true;
-				await snapshot?.dispose();
-				await api.close();
-			}),
+		// Closed first, so a query waiting on a process that has stopped answering is released.
+		close: async () => {
+			closed = true;
+			await api.close();
+			await sequence;
+		},
 	};
 }
