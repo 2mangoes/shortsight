@@ -33,6 +33,7 @@ const environment = [
 	"SIGHTREAD_DAEMON_START_DELAY_MS",
 	"SIGHTREAD_DAEMON_QUERY_DELAY_MS",
 	"SIGHTREAD_DAEMON_STOP_DELAY_MS",
+	"SIGHTREAD_DAEMON_STATE_DELAY_MS",
 	"SIGHTREAD_DAEMON_SOCKET_ERROR_ON_RESET",
 ] as const;
 const originals = new Map(environment.map((name) => [name, process.env[name]]));
@@ -70,9 +71,14 @@ const second = fixture({
 const project = (root: string) => ({ root, tsconfig: join(root, "tsconfig.json") });
 const lookup = (query: string) => [{ type: "lookup", query }];
 
+// What a CLI request that has to start the project's server prints to stderr, and nothing else.
+const announced = (root: string) => `sightread: starting a server for ${root}; the first request may take a while\n`;
+
 async function cli(...args: string[]) {
 	const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), ...args], {
 		env: { ...Bun.env },
+		stdout: "pipe",
+		stderr: "pipe",
 	});
 	const [code, out, err] = await Promise.all([
 		child.exited,
@@ -187,7 +193,7 @@ test("a long XDG runtime directory falls back for query, ps, and stop", async ()
 		expect(stateParent()).toBe(join(tmpdir(), `sightread-${process.getuid?.() ?? 0}`));
 		const query = await cli("--cwd", disposable.root, JSON.stringify({ type: "lookup", query: "fallback" }));
 		expect(query.code).toBe(0);
-		expect(query.err).toBe("");
+		expect(query.err).toBe(announced(disposable.root));
 		expect(query.out).toContain("fallback  exported function  src/model.ts:1-1");
 		const listed = await cli("ps");
 		expect(listed.code).toBe(0);
@@ -219,7 +225,7 @@ test("an owned fallback parent is tightened", async () => {
 		expect(statSync(unsafeParent).mode & 0o777).toBe(0o700);
 		const query = await cli("--cwd", disposable.root, JSON.stringify({ type: "lookup", query: "safeFallback" }));
 		expect(query.code).toBe(0);
-		expect(query.err).toBe("");
+		expect(query.err).toBe(announced(disposable.root));
 		expect(query.out).toContain("safeFallback  exported function  src/model.ts:1-1");
 	} finally {
 		await stopServer(project(disposable.root));
@@ -308,7 +314,7 @@ test("concurrent CLI processes start one server", async () => {
 		JSON.stringify({ type: "lookup", query: "greet" }),
 	];
 	const calls = Array.from({ length: 2 }, () =>
-		Bun.spawn(args, { cwd: first.root, env: { ...Bun.env, XDG_RUNTIME_DIR: runtime } }),
+		Bun.spawn(args, { cwd: first.root, env: { ...Bun.env, XDG_RUNTIME_DIR: runtime }, stdout: "pipe", stderr: "pipe" }),
 	);
 	const outputs = await Promise.all(
 		calls.map(async (child) => ({
@@ -317,9 +323,11 @@ test("concurrent CLI processes start one server", async () => {
 			err: await new Response(child.stderr).text(),
 		})),
 	);
+	// Either may find no server and say it's starting one; neither says anything else.
+	expect(outputs.some((output) => output.err === announced(first.root))).toBe(true);
 	for (const output of outputs) {
 		expect(output.code).toBe(0);
-		expect(output.err).toBe("");
+		expect(["", announced(first.root)]).toContain(output.err);
 		expect(output.out).toContain("greet  exported function  src/model.ts:1-1");
 	}
 	expect((await listServers()).filter(({ project: root }) => root === first.root)).toHaveLength(1);
@@ -425,6 +433,8 @@ try {
 			SIGHTREAD_MAX_SERVERS: "1",
 			SIGHTREAD_DAEMON_START_DELAY_MS: "1000",
 		},
+		stdout: "pipe",
+		stderr: "pipe",
 	});
 	const [exit, stdout, stderr] = await Promise.all([
 		child.exited,
@@ -675,3 +685,47 @@ test("starters reclaiming a dead holder's lock never hold it together", async ()
 	expect(most).toBe(1);
 	expect(existsSync(directory)).toBe(false);
 }, 30_000);
+
+test("a state write still in flight when a daemon stops doesn't replace a replacement's state", async () => {
+	await stopAllServers();
+	process.env.SIGHTREAD_DAEMON_STATE_DELAY_MS = "500";
+	const current = project(first.root);
+	const paths = serverPaths(current);
+	try {
+		const retiring = await connect(current);
+		// A query starts a state write that pauses before it lands.
+		const pending = retiring.query(lookup("greet"), {}).catch(() => undefined);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const aside = `${paths.socket}.old`;
+		renameSync(paths.socket, aside);
+		const replacement = createServer(() => undefined);
+		await new Promise<void>((resolve) => replacement.listen(paths.socket, resolve));
+		const state = JSON.stringify({
+			project: current.root,
+			tsconfig: current.tsconfig,
+			pid: 1,
+			lastUsed: 0,
+			startedAt: 0,
+		});
+		writeFileSync(paths.state, state);
+		try {
+			await exchange(aside, { type: "stop" });
+			await pending;
+			await until(async () => {
+				try {
+					process.kill(retiring.pid, 0);
+					return false;
+				} catch {
+					return true;
+				}
+			}, 15_000);
+			expect(readFileSync(paths.state, "utf8")).toBe(state);
+		} finally {
+			replacement.close();
+			rmSync(aside, { force: true });
+			rmSync(paths.state, { force: true });
+		}
+	} finally {
+		delete process.env.SIGHTREAD_DAEMON_STATE_DELAY_MS;
+	}
+}, 45_000);

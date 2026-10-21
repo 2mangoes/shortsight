@@ -1,5 +1,6 @@
 // Query graph impact and add syntax-backed callers, chains, and direct test sites.
 import { readFile, stat } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
 import { fromHandle, object, traceCut, type GraphNode } from "../model.ts";
@@ -253,7 +254,9 @@ function createLookup(git: GitChanges, project: Project, parser: DeclarationPars
 	};
 	const nodeFor = async (handle: string): Promise<GraphNode | undefined> => {
 		const ref = fromHandle(handle);
-		if (!ref || git.projectPath(`${git.project === "." ? "" : `${git.project}/`}${ref.file}`).outside) return undefined;
+		// A caller in a sibling package is the graph's too, as `../lib/shared.ts`; one outside the repository isn't.
+		if (!ref || relative(git.repository, resolve(realpathSync(project.root), ref.file)).startsWith(".."))
+			return undefined;
 		const items = (await getDeclarations(ref.file)).filter((item) => handleFor(ref.file, item) === handle);
 		return {
 			handle,

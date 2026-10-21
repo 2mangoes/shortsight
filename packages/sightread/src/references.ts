@@ -1,7 +1,7 @@
 // Find every compiler-resolved use of a graph symbol in the project's real files.
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { realpathSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { API, type Snapshot, SymbolFlags } from "typescript/unstable/async";
 import {
 	getTouchingPropertyName,
@@ -141,12 +141,60 @@ async function stampsOf(files: Iterable<string>): Promise<Map<string, string>> {
 	return found;
 }
 
+// A file TypeScript could resolve an import to.
+const SOURCE = /\.(?:[cm]?[jt]sx?|json)$/;
+
+// Each directory's entries, by its mtime, which changes when one is added or removed.
+interface Listing {
+	stamp: number;
+	entries: Set<string>;
+}
+
+async function listing(directory: string): Promise<Listing | undefined> {
+	const found = await stat(directory).catch(() => undefined);
+	if (!found?.isDirectory()) return undefined;
+	const entries = await readdir(directory).catch(() => [] as string[]);
+	return { stamp: found.mtimeMs, entries: new Set(entries) };
+}
+
+// Every source file under a directory that has just appeared, outside node_modules.
+async function sourcesUnder(directory: string): Promise<string[]> {
+	const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+	const found: string[] = [];
+	for (const entry of entries) {
+		const path = join(directory, entry.name);
+		if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith("."))
+			found.push(...(await sourcesUnder(path)));
+		else if (entry.isFile() && SOURCE.test(entry.name)) found.push(path);
+	}
+	return found;
+}
+
 /** Keep one TypeScript language service for a daemon's lifetime, brought up to date before each query. */
 export function createReferenceIndex(project: Project): ReferenceIndex {
 	const api = new API({ cwd: project.root });
 	const stamps = new Map<string, string>();
 	// Files the program loaded that have since gone, so their return is seen as a new file.
 	const missing = new Set<string>();
+	// The directories of the files the program loads, so a file an import couldn't resolve to is seen when it appears.
+	const listings = new Map<string, Listing>();
+	const appeared = async (): Promise<string[]> => {
+		const found: string[] = [];
+		for (const [directory, before] of listings) {
+			const now = (await stat(directory).catch(() => undefined))?.mtimeMs;
+			if (now === before.stamp) continue;
+			const after = await listing(directory);
+			if (!after) continue;
+			listings.set(directory, after);
+			for (const entry of after.entries) {
+				if (before.entries.has(entry)) continue;
+				const path = join(directory, entry);
+				if (SOURCE.test(entry)) found.push(path);
+				else found.push(...(await sourcesUnder(path)));
+			}
+		}
+		return found;
+	};
 	let snapshot: Snapshot | undefined;
 	let sequence: Promise<unknown> = Promise.resolve();
 	let closed = false;
@@ -160,6 +208,7 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		const created = [...current.keys()].filter((file) => !stamps.has(file) && (roots.has(file) || missing.has(file)));
 		const changed = [...current.keys()].filter((file) => stamps.has(file) && stamps.get(file) !== current.get(file));
 		const deleted = [...stamps.keys()].filter((file) => !current.has(file));
+		for (const file of await appeared()) if (!current.has(file) && !created.includes(file)) created.push(file);
 		const previous = snapshot;
 		if (previous && !created.length && !changed.length && !deleted.length) return previous;
 		snapshot = previous
@@ -179,6 +228,11 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		stamps.clear();
 		for (const [file, stamp] of [...current, ...added])
 			if (roots.has(file) || loaded.has(file)) stamps.set(file, stamp);
+		for (const directory of new Set([...roots, ...loaded].map((file) => dirname(file))))
+			if (!listings.has(directory)) {
+				const found = await listing(directory);
+				if (found) listings.set(directory, found);
+			}
 		if (previous) {
 			api.clearSourceFileCache();
 			await previous.dispose();

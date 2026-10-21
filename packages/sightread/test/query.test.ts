@@ -478,7 +478,7 @@ test("a reverse trace whose hop budget ran out on its direct users says it left 
 	const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target });
 	expect(result.shown).toBe(40);
 	expect(result.raise).toBe("trace.maxNodes");
-	expect(result.note).toStartWith("stopped at 1000 symbols");
+	expect(result.note).toStartWith("stopped at the graph's limit of 2000 hops");
 });
 
 test("a member with no node follows focus from its first hop", async () => {
@@ -517,6 +517,45 @@ test("a member with no node follows focus from its first hop", async () => {
 		expect(await kinds()).toEqual(["accesses", "type_ref"]);
 		expect(await kinds("execution")).toEqual(["accesses"]);
 		expect(await kinds("types")).toEqual(["type_ref"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a member with no node, traced one level, says when its users have users of their own", async () => {
+	const root = mkdtempSync(join(realpathSync("/tmp"), "sr-nodeless-depth-"));
+	writeFileSync(join(root, "a.ts"), "export function first() { return box.prop; }\n");
+	const nodeless: RangeIndex = {
+		...ranges,
+		declarations: async () => [
+			{ name: "Box.prop", kind: "property", start: 1, end: 1, codeStart: 1, unindexed: "member" },
+		],
+	};
+	const references = {
+		query: async () => ({
+			type: "references",
+			shown: 1,
+			edges: [],
+			sections: {},
+			nodes: [reference(1, "a.ts#first:function")],
+		}),
+		reexport: async () => undefined,
+		close: async () => {},
+	} as unknown as ReferenceIndex;
+	const used = (dependents: unknown[]): GraphClient => ({
+		...client,
+		query: async (request) => ({
+			value: {
+				result: { type: request.type, nodes: [{ ...symbol("a.ts#first:function"), dependedOnBy: dependents }] },
+			},
+			isError: false,
+		}),
+	});
+	try {
+		const trace = (graph: GraphClient) =>
+			traceWith({ client: graph, ranges: nodeless, references, root }, { from: "a.ts#Box.prop:variable", maxDepth: 1 });
+		expect((await trace(used([{ ...symbol("a.ts#outer:function"), relation: "calls" }]))).raise).toBe("trace.maxDepth");
+		expect((await trace(used([]))).raise).toBeUndefined();
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

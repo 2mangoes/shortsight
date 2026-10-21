@@ -882,3 +882,44 @@ test("a file the project's roots import is in the project", async () => {
 	expect(output).not.toContain("outside the graphed project");
 	expect(output).toContain("1-3  impl  edited\n  └─ called by client/src/main.ts:2-2  main");
 }, 30_000);
+
+test("an overload taken out edits the function it belonged to", async () => {
+	const f = fixture({
+		"client/src/format.ts":
+			"export function a() {}\nexport function f(x: string): string;\nexport function f(x: string | number) {\n\treturn x;\n}\n",
+	});
+	f.put("client/src/format.ts", "export function a() {}\nexport function f(x: string | number) {\n\treturn x;\n}\n");
+	const output = await f.run();
+	expect(output).toStartWith(`diff against ${f.sha.slice(0, 12)} in client: f edited`);
+	expect(output).not.toContain("  a  ");
+}, 30_000);
+
+test("a changed line belongs to every declaration on it, of whatever length", async () => {
+	const f = fixture({
+		"client/src/pair.ts": "export function a() { return 1; } export function b(x: number) {\n\treturn x;\n}\n",
+	});
+	f.put("client/src/pair.ts", "export function a() { return 1; } export function b(x: string) {\n\treturn x;\n}\n");
+	const output = await f.run();
+	expect(output).toContain("  a  edited");
+	expect(output).toContain("  b  edited");
+}, 30_000);
+
+test("a sibling package's file the project imports is diffed, with callers in other packages", async () => {
+	const f = fixture({
+		"lib/shared.ts": "export function shared() {\n\treturn 1;\n}\n",
+		"other/use.ts": 'import { shared } from "../lib/shared.ts";\nexport function viaOther() {\n\treturn shared();\n}\n',
+		"client/src/app.ts": 'import { viaOther } from "../../other/use.ts";\nexport const app = () => viaOther();\n',
+	});
+	f.put(
+		"client/tsconfig.json",
+		'{"compilerOptions":{"allowImportingTsExtensions":true,"noEmit":true,"module":"nodenext"},"include":["src"]}\n',
+	);
+	git(f.repo, "add", "client/tsconfig.json");
+	git(f.repo, "commit", "-qm", "only src is a root");
+	f.put("lib/shared.ts", "export function shared() {\n\treturn 2;\n}\n");
+	const output = await f.run();
+	expect(output).not.toContain("outside the project");
+	expect(output).toContain(
+		"lib/shared.ts\n  1-3  shared  edited\n  └─ called by other/use.ts:2-4  viaOther\n     └─ called by client/src/app.ts:2-2  app",
+	);
+}, 30_000);

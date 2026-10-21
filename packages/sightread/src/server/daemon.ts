@@ -89,8 +89,15 @@ export async function runDaemon(project: Project): Promise<void> {
 		if (state?.pid === process.pid) await unlink(paths.state).catch(() => undefined);
 	}
 
-	async function writeState(): Promise<void> {
-		// Once closing, the state path may already be a replacement's.
+	// State writes still in flight, which shutdown waits for before a replacement can start.
+	const writing = new Set<Promise<void>>();
+	function writeState(): Promise<void> {
+		const write = publishState().finally(() => writing.delete(write));
+		writing.add(write);
+		return write;
+	}
+	async function publishState(): Promise<void> {
+		// Once closing, the state path may soon be a replacement's.
 		if (closing) return;
 		const temporary = `${paths.state}.${randomUUID()}`;
 		await writeFile(
@@ -104,6 +111,13 @@ export async function runDaemon(project: Project): Promise<void> {
 				signature,
 			}),
 		);
+		if (process.env.SIGHTREAD_DAEMON_STATE_DELAY_MS) await Bun.sleep(duration("SIGHTREAD_DAEMON_STATE_DELAY_MS", 0));
+		// Checked again with nothing awaited before the rename, so a write that began before shutdown either lands
+		// before it releases the socket or not at all.
+		if (closing) {
+			await unlink(temporary).catch(() => undefined);
+			return;
+		}
 		await rename(temporary, paths.state);
 	}
 
@@ -111,6 +125,7 @@ export async function runDaemon(project: Project): Promise<void> {
 		if (closing) return;
 		closing = true;
 		clearInterval(interval);
+		await Promise.allSettled(writing);
 		// Bun's close removes whatever file is at the socket's path. A socket a replacement has put there is left alone:
 		// nothing reaches this daemon through it, so the listener only stops keeping the process alive.
 		if ((await identity(paths.socket)) === socketIdentity) server.close();

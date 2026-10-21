@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
 	fromHandle,
+	HOPS_PER_NODE,
 	inheritRequest,
 	normalizeResult,
 	object,
@@ -186,7 +187,9 @@ async function reverseTrace(
 		nodeless
 			? `${fromHandle(String(request.from))?.name} has no graph node, so its direct users come from its references`
 			: "",
-		capped ? `stopped at ${plural(limit, "symbol")}; trace from a narrower symbol` : "",
+		capped
+			? `stopped at ${walk.hopCut ? `the graph's limit of ${budgetFor(limit) * HOPS_PER_NODE} hops` : plural(limit, "symbol")}; trace from a narrower symbol`
+			: "",
 		hub
 			? `only direct users are shown, since there are more than ${HUB_USERS}; pass maxDepth to follow their users too`
 			: "",
@@ -215,6 +218,8 @@ interface Walk {
 	withheld: boolean;
 	/** The walk reached its depth with more beyond it, as far as the graph can tell. */
 	deeper: boolean;
+	/** The graph's hop budget, not its symbol budget, cut the walk. */
+	hopCut: boolean;
 	/** Direct users whose own users couldn't be traced, or references that couldn't be read. */
 	skipped: number;
 }
@@ -241,6 +246,7 @@ function cut(
 			(budgetCut && (direct >= budgetFor(limit) || !found.some((symbol) => Number(symbol.depth) > 1))),
 		withheld: false,
 		deeper: false,
+		hopCut: budgetCut && walked.length >= budgetFor(limit) * HOPS_PER_NODE,
 		skipped: 0,
 	};
 }
@@ -361,6 +367,14 @@ async function fromReferences(
 			for (const hop of records(trace.hops)) hops.set(hopKey(hop), hop);
 		}
 	}
+	// At depth one there are no traces past the direct users, so ask once whether any of them is used in turn.
+	if (maxDepth === 1 && callers.length)
+		deeper = await context.client
+			.query({ type: "details", handles: callers, neighbors: true, neighborLimit: 1 })
+			.then(({ value }) =>
+				records(traceOf(value)?.nodes).some((node) => Array.isArray(node.dependedOnBy) && node.dependedOnBy.length > 0),
+			)
+			.catch(() => false);
 	// A hop is one level past the symbol it reaches, as in the graph's walk.
 	const walked = [...hops.values()].map((hop) => ({ ...hop, depth: (depth.get(String(hop.to)) ?? 0) + 1 }));
 	// Its direct users come from references, which the graph's budget can't cut.
