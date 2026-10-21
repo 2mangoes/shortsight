@@ -1,13 +1,12 @@
 // Run one working-tree diff with one parser and the existing graph daemon.
 import { programFiles, type Project } from "../project.ts";
 import { realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { createPaths } from "../paths.ts";
 import { createDeclarationParser } from "../ranges.ts";
 import { matchChanges } from "./changes.ts";
 import { readGitChanges } from "./git.ts";
-import { collectImpact, importPaths, importsFile } from "./impact.ts";
+import { collectImpact } from "./impact.ts";
 import { formatDiffNotes, renderDiffText, type DiffResult } from "./render.ts";
 
 const realOrSelf = (file: string) => {
@@ -33,40 +32,14 @@ export async function runDiff(
 		const files = await programFiles(project);
 		// Git names files by their real paths; the program may name them through a symlink, as /tmp on macOS.
 		const real = new Set([...files].map((file) => realOrSelf(file)));
-		// A deleted file isn't in the program any more; it was if something the program holds still imports it, by a
-		// relative path or through the config's paths.
-		const config = await importPaths(project);
-		const root = realOrSelf(project.root);
-		const sources = await Promise.all(
-			[...files].map(async (file) => ({
-				importer: relative(root, realOrSelf(file)).split(sep).join("/"),
-				text: await readFile(file, "utf8").catch(() => ""),
-			})),
-		);
-		const importedBefore = new Map<string, boolean>();
-		const importedFile = (absolute: string) => {
-			const target = relative(root, absolute).split(sep).join("/");
-			let found = importedBefore.get(target);
-			if (found === undefined) {
-				found = sources.some(({ importer, text }) => importsFile(text, importer, target, config));
-				importedBefore.set(target, found);
-			}
-			return found;
-		};
-		const matched = await matchChanges(
-			git,
-			project.root,
-			parser,
-			(absolute) => real.has(realOrSelf(absolute)) || importedFile(absolute),
-		);
+		const matched = await matchChanges(git, project.root, parser, (absolute) => real.has(realOrSelf(absolute)));
 		const inProject = ({ node, file }: (typeof matched.changed)[number]) =>
 			(files.has(resolve(project.root, node.file)) && !/\.d\.[cm]?ts$/.test(node.file)) ||
-			// A deleted file isn't on disk to check against the config, so count it if it was inside the project, or
-			// something the program holds still imports it, as a sibling package's file.
+			// A deleted file isn't on disk to check against the config, so count it if it was inside the project.
 			(file.status === "deleted" &&
+				!node.file.startsWith("../") &&
 				!isAbsolute(node.file) &&
-				!node.file.split("/").includes("node_modules") &&
-				(!node.file.startsWith("../") || importedFile(resolve(root, node.file))));
+				!node.file.split("/").includes("node_modules"));
 		const outside = matched.changed.filter((change) => !inProject(change));
 		matched.changed = matched.changed.filter(inProject);
 		if (outside.length)

@@ -1,10 +1,8 @@
-// Serialize server starts with an OS file lock. The OS releases it when its holder exits, however it exits, so a lock
-// is never left stale and none has to be reclaimed: reclaiming one, by checking its holder and then removing it, can
-// always race with a holder that has just taken it.
+// OS file locks, which the OS releases when their holder exits, however it exits, so none is ever left stale.
 import { dlopen, FFIType } from "bun:ffi";
-import { closeSync, openSync, readFileSync, rmdirSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, openSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 
 const LOCK_EX = 2;
 const LOCK_NB = 4;
@@ -20,71 +18,31 @@ function flock(fd: number, operation: number): number {
 
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-function running(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
+// A lock's file stays: removing it while another process waits on it would let a third lock a new file at the path.
+const openLock = (path: string) => openSync(path, "a");
 
-// An earlier version locked with a directory holding its holder's pid. One whose holder has gone is taken apart, its
-// file and then itself, which can fail but never remove a lock file another process has just made in its place.
-// Returns whether the path is free of a live one.
-function clearLegacy(path: string): boolean {
-	try {
-		if (!statSync(path).isDirectory()) return true;
-	} catch {
-		return true;
-	}
-	let pid = 0;
-	try {
-		pid = Number(readFileSync(join(path, "pid"), "utf8"));
-	} catch {
-		// Its holder may not have written it.
-	}
-	if (pid > 0 && running(pid)) return false;
-	try {
-		unlinkSync(join(path, "pid"));
-	} catch {
-		// Already gone.
-	}
-	try {
-		rmdirSync(path);
-	} catch {
-		// Not empty, or already a file: left as it is.
-	}
-	return true;
-}
-
-// The lock's file, which stays: removing it while another process waits on it would let a third lock a new file at
-// the same path. Undefined while an earlier version's lock is still held there.
-function openLock(path: string): number | undefined {
-	if (!clearLegacy(path)) return undefined;
-	try {
-		return openSync(path, "a");
-	} catch {
-		// A directory that couldn't be removed yet.
-		return undefined;
-	}
+/** Take the lock at `path` for the rest of this process's life, if nothing else holds it. */
+export function holdLock(path: string): boolean {
+	const fd = openLock(path);
+	if (flock(fd, LOCK_EX | LOCK_NB) === 0) return true;
+	closeSync(fd);
+	return false;
 }
 
 /** Run `action` holding the lock at `path`, waiting up to 15 seconds for it. */
 export async function withStartLock<T>(path: string, action: () => Promise<T>): Promise<T> {
 	const until = Date.now() + 15_000;
 	await mkdir(dirname(path), { recursive: true });
-	let fd = openLock(path);
+	const fd = openLock(path);
 	try {
-		while (fd === undefined || flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+		while (flock(fd, LOCK_EX | LOCK_NB) !== 0) {
 			if (Date.now() >= until) throw new Error("server start lock timed out; retry");
 			await pause(50);
-			fd ??= openLock(path);
 		}
 		return await action();
 	} finally {
 		// Closing the file releases the lock.
-		if (fd !== undefined) closeSync(fd);
+		closeSync(fd);
 	}
 }
 
@@ -92,8 +50,8 @@ export async function withStartLock<T>(path: string, action: () => Promise<T>): 
 export function lockHeld(path: string): boolean {
 	let fd: number;
 	try {
-		if (statSync(path).isDirectory()) return false;
-		fd = openSync(path, "a");
+		// Opened without creating it: no file, no lock.
+		fd = openSync(path, "r");
 	} catch {
 		return false;
 	}

@@ -1,7 +1,7 @@
 // Find every compiler-resolved use of a graph symbol in the project's real files.
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { realpathSync } from "node:fs";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { API, type Snapshot, SymbolFlags } from "typescript/unstable/async";
 import {
 	getTouchingPropertyName,
@@ -142,117 +142,26 @@ async function stampsOf(files: Iterable<string>): Promise<Map<string, string>> {
 	return found;
 }
 
-// A file TypeScript could resolve an import to.
-const SOURCE = /\.(?:[cm]?[jt]sx?|json)$/;
-
-// Each directory's entries, by its mtime, which changes when one is added or removed.
-interface Listing {
-	stamp: number;
-	entries: Set<string>;
-}
-
-async function listing(directory: string): Promise<Listing | undefined> {
-	const found = await stat(directory).catch(() => undefined);
-	if (!found?.isDirectory()) return undefined;
-	const entries = await readdir(directory).catch(() => [] as string[]);
-	return { stamp: found.mtimeMs, entries: new Set(entries) };
-}
-
-// A relative import's specifier, from `import`, `export … from`, a dynamic `import()` or `require()`.
-const SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
-const EXTENSIONS = ["", ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json"];
-
-const exists = (path: string) =>
-	stat(path).then(
-		() => true,
-		() => false,
-	);
-
-// The nearest existing directory above each file the program's relative imports name that doesn't exist yet, so
-// one created there, or in a directory created there, is seen: an import TypeScript couldn't resolve has no file to
-// watch.
-async function unresolvedImportDirectories(files: Iterable<string>): Promise<Set<string>> {
-	const found = new Set<string>();
-	await Promise.all(
-		[...files].map(async (file) => {
-			const text = await readFile(file, "utf8").catch(() => "");
-			for (const [, specifier] of text.matchAll(SPECIFIER)) {
-				const target = resolve(dirname(file), specifier!);
-				const base = target.replace(/\.(?:[cm]?[jt]sx?)$/, "");
-				const candidates = [
-					target,
-					...EXTENSIONS.map((extension) => base + extension),
-					...EXTENSIONS.map((extension) => join(target, `index${extension || ".ts"}`)),
-				];
-				if ((await Promise.all(candidates.map(exists))).some(Boolean)) continue;
-				let directory = dirname(target);
-				while (!(await exists(directory)) && dirname(directory) !== directory) directory = dirname(directory);
-				found.add(directory);
-			}
-		}),
-	);
-	return found;
-}
-
-// Every directory under one, outside node_modules and hidden ones, itself included.
-async function directoriesUnder(directory: string): Promise<string[]> {
-	const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
-	const found = [directory];
-	for (const entry of entries)
-		if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith("."))
-			found.push(...(await directoriesUnder(join(directory, entry.name))));
-	return found;
-}
-
 /** Keep one TypeScript language service for a daemon's lifetime, brought up to date before each query. */
 export function createReferenceIndex(project: Project): ReferenceIndex {
 	let api = new API({ cwd: project.root });
 	const stamps = new Map<string, string>();
-	// Files the program loaded that have since gone, so their return is seen as a new file.
-	const missing = new Set<string>();
-	// The directories of the files the program loads, and those under them, so a file an import couldn't resolve to is
-	// seen when it appears, in a directory that already held one or one that didn't.
-	const listings = new Map<string, Listing>();
-	const appeared = async (): Promise<string[]> => {
-		const found: string[] = [];
-		for (const [directory, before] of listings) {
-			const now = (await stat(directory).catch(() => undefined))?.mtimeMs;
-			if (now === before.stamp) continue;
-			const after = await listing(directory);
-			if (!after) continue;
-			listings.set(directory, after);
-			for (const entry of after.entries) {
-				if (before.entries.has(entry)) continue;
-				const path = join(directory, entry);
-				if (SOURCE.test(entry)) found.push(path);
-				// A new directory is watched from now on, empty or not, with those under it; any sources already in
-				// them are new too.
-				else
-					for (const under of await directoriesUnder(path)) {
-						if (listings.has(under)) continue;
-						const listed = await listing(under);
-						if (!listed) continue;
-						listings.set(under, listed);
-						for (const name of listed.entries) if (SOURCE.test(name)) found.push(join(under, name));
-					}
-			}
-		}
-		return found;
-	};
+	// Every file the program has loaded, so one only imported is seen when it changes, goes or comes back. A file
+	// outside the config's roots that an import couldn't resolve until it was created isn't: a restart finds it.
+	const known = new Set<string>();
 	let snapshot: Snapshot | undefined;
 	let sequence: Promise<unknown> = Promise.resolve();
 	let closed = false;
 
-	// Compare the size and mtime of every file the last snapshot loaded, and of the config's roots, with the last
-	// query's, and send TypeScript only what changed. A file only imported, or a declaration file, counts too.
+	// Compare the size and mtime of the config's roots and every file the program has loaded with the last query's,
+	// and send TypeScript only what changed.
 	const refresh = async (): Promise<Snapshot> => {
 		if (closed) throw new Error("Reference index is closed");
 		const roots = await projectFiles(project, api);
-		const current = await stampsOf(new Set([...roots, ...stamps.keys(), ...missing]));
-		const created = [...current.keys()].filter((file) => !stamps.has(file) && (roots.has(file) || missing.has(file)));
+		const current = await stampsOf(new Set([...roots, ...known]));
+		const created = [...current.keys()].filter((file) => !stamps.has(file));
 		const changed = [...current.keys()].filter((file) => stamps.has(file) && stamps.get(file) !== current.get(file));
 		const deleted = [...stamps.keys()].filter((file) => !current.has(file));
-		for (const file of await appeared()) if (!current.has(file) && !created.includes(file)) created.push(file);
 		const previous = snapshot;
 		if (previous && !created.length && !changed.length && !deleted.length) return previous;
 		snapshot = previous
@@ -266,26 +175,11 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		// Record the files only once TypeScript has them, so a failed update is retried next time: those compared now,
 		// and any the program has just started loading.
 		const loaded = await sourceFileNames(snapshot);
+		for (const file of loaded) known.add(file);
 		const added = await stampsOf([...loaded].filter((file) => !current.has(file)));
-		for (const file of deleted) missing.add(file);
-		for (const file of created) missing.delete(file);
 		stamps.clear();
 		for (const [file, stamp] of [...current, ...added])
 			if (roots.has(file) || loaded.has(file)) stamps.set(file, stamp);
-		for (const directory of new Set([...roots, ...loaded].map((file) => dirname(file))))
-			if (!listings.has(directory))
-				for (const under of await directoriesUnder(directory))
-					if (!listings.has(under)) {
-						const found = await listing(under);
-						if (found) listings.set(under, found);
-					}
-		// Where a relative import names a file that isn't there yet, the directory it would appear in, or the nearest
-		// above it that exists: watched on its own, since what's under it isn't the project's.
-		for (const directory of await unresolvedImportDirectories(loaded))
-			if (!listings.has(directory)) {
-				const found = await listing(directory);
-				if (found) listings.set(directory, found);
-			}
 		if (previous) {
 			api.clearSourceFileCache();
 			await previous.dispose();
@@ -299,8 +193,7 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		api = new API({ cwd: project.root });
 		snapshot = undefined;
 		stamps.clear();
-		missing.clear();
-		listings.clear();
+		known.clear();
 	};
 	// A process that exited between queries fails the next request at once, as a closed connection rather than an
 	// exit, so it's checked before each query and after any failure.

@@ -5,9 +5,7 @@ import {
 	existsSync,
 	mkdtempSync,
 	mkdirSync,
-	readFileSync,
 	realpathSync,
-	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -33,8 +31,6 @@ const environment = [
 	"SIGHTREAD_DAEMON_START_DELAY_MS",
 	"SIGHTREAD_DAEMON_QUERY_DELAY_MS",
 	"SIGHTREAD_DAEMON_STOP_DELAY_MS",
-	"SIGHTREAD_DAEMON_STATE_DELAY_MS",
-	"SIGHTREAD_START_TIMEOUT_MS",
 	"SIGHTREAD_DAEMON_SOCKET_ERROR_ON_RESET",
 ] as const;
 const originals = new Map(environment.map((name) => [name, process.env[name]]));
@@ -399,14 +395,12 @@ test("a quiet timestamp cannot evict a server during a query", async () => {
 	process.env.SIGHTREAD_DAEMON_QUERY_DELAY_MS = "3000";
 	try {
 		const firstServer = await connect(project(first.root));
-		const state = serverPaths(project(first.root)).state;
-		const before = (JSON.parse(await Bun.file(state).text()) as { lastUsed: number }).lastUsed;
+		const socket = serverPaths(project(first.root)).socket;
+		const lastUsed = async () => ((await exchange(socket, { type: "ping" })) as { lastUsed: number }).lastUsed;
+		const before = await lastUsed();
 		await Bun.sleep(50);
 		const query = firstServer.query(lookup("greet"), {});
-		await until(async () => {
-			const live = JSON.parse(await Bun.file(state).text()) as { lastUsed: number };
-			return live.lastUsed > before;
-		});
+		await until(async () => (await lastUsed()) > before);
 		const secondServer = await connect(project(second.root));
 		expect((await listServers()).map(({ pid }) => pid).toSorted()).toEqual(
 			[firstServer.pid, secondServer.pid].toSorted(),
@@ -627,44 +621,6 @@ test("a reply split inside a character is decoded whole", async () => {
 	}
 });
 
-test("a stopping daemon leaves a replacement's socket and state alone", async () => {
-	await stopAllServers();
-	const current = project(first.root);
-	const paths = serverPaths(current);
-	const retiring = await connect(current);
-	// A replacement takes the paths while the old daemon is still finishing: its socket is moved aside, so it can
-	// still be told to stop.
-	const aside = `${paths.socket}.old`;
-	renameSync(paths.socket, aside);
-	const replacement = createServer(() => undefined);
-	await new Promise<void>((resolve) => replacement.listen(paths.socket, resolve));
-	const state = JSON.stringify({
-		project: current.root,
-		tsconfig: current.tsconfig,
-		pid: 1,
-		lastUsed: 0,
-		startedAt: 0,
-	});
-	writeFileSync(paths.state, state);
-	try {
-		await exchange(aside, { type: "stop" });
-		await until(async () => {
-			try {
-				process.kill(retiring.pid, 0);
-				return false;
-			} catch {
-				return true;
-			}
-		}, 15_000);
-		expect(existsSync(paths.socket)).toBe(true);
-		expect(readFileSync(paths.state, "utf8")).toBe(state);
-	} finally {
-		replacement.close();
-		rmSync(aside, { force: true });
-		rmSync(paths.state, { force: true });
-	}
-}, 45_000);
-
 test("starters never hold the start lock together, and a holder that dies frees it", async () => {
 	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-")), "start.lock");
 	let holding = 0;
@@ -702,50 +658,6 @@ await withStartLock(${JSON.stringify(path)}, async () => { console.log("held"); 
 	expect(taken).toBe(true);
 }, 30_000);
 
-test("a state write still in flight when a daemon stops doesn't replace a replacement's state", async () => {
-	await stopAllServers();
-	process.env.SIGHTREAD_DAEMON_STATE_DELAY_MS = "500";
-	const current = project(first.root);
-	const paths = serverPaths(current);
-	try {
-		const retiring = await connect(current);
-		// A query starts a state write that pauses before it lands.
-		const pending = retiring.query(lookup("greet"), {}).catch(() => undefined);
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		const aside = `${paths.socket}.old`;
-		renameSync(paths.socket, aside);
-		const replacement = createServer(() => undefined);
-		await new Promise<void>((resolve) => replacement.listen(paths.socket, resolve));
-		const state = JSON.stringify({
-			project: current.root,
-			tsconfig: current.tsconfig,
-			pid: 1,
-			lastUsed: 0,
-			startedAt: 0,
-		});
-		writeFileSync(paths.state, state);
-		try {
-			await exchange(aside, { type: "stop" });
-			await pending;
-			await until(async () => {
-				try {
-					process.kill(retiring.pid, 0);
-					return false;
-				} catch {
-					return true;
-				}
-			}, 15_000);
-			expect(readFileSync(paths.state, "utf8")).toBe(state);
-		} finally {
-			replacement.close();
-			rmSync(aside, { force: true });
-			rmSync(paths.state, { force: true });
-		}
-	} finally {
-		delete process.env.SIGHTREAD_DAEMON_STATE_DELAY_MS;
-	}
-}, 45_000);
-
 test("a start lock held by a live process times out instead of waiting forever", async () => {
 	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-wait-")), "start.lock");
 	const { promise: holding, resolve: release } = Promise.withResolvers<void>();
@@ -762,7 +674,7 @@ test("a start lock held by a live process times out instead of waiting forever",
 	}
 }, 30_000);
 
-test("stopping a server that has stopped answering fails, and leaves its files", async () => {
+test("stopping a server that has stopped answering fails, and leaves its socket", async () => {
 	await stopAllServers();
 	const current = project(first.root);
 	const paths = serverPaths(current);
@@ -775,87 +687,24 @@ test("stopping a server that has stopped answering fails, and leaves its files",
 				(error: Error) => error.message,
 			),
 		).toBe(`server is not responding; see ${paths.log}`);
-		expect([existsSync(paths.socket), existsSync(paths.state)]).toEqual([true, true]);
+		expect(existsSync(paths.socket)).toBe(true);
 	} finally {
 		process.kill(stuck.pid, "SIGCONT");
 		await stopServer(current);
 	}
 }, 45_000);
 
-test("a server that doesn't start in time is stopped, not left to take the socket later", async () => {
-	await stopAllServers();
-	const disposable = fixture({ "src/late.ts": "export function late() { return 1; }\n" });
-	const current = project(disposable.root);
-	const paths = serverPaths(current);
-	// A daemon slower to start than the client waits for.
-	process.env.SIGHTREAD_START_TIMEOUT_MS = "500";
-	process.env.SIGHTREAD_DAEMON_START_DELAY_MS = "3000";
-	try {
-		expect(
-			await connect(current).then(
-				() => "started",
-				(error: Error) => error.message,
-			),
-		).toBe(`server did not start; see ${paths.log}`);
-		// Past the delay it would have started after.
-		await new Promise((resolve) => setTimeout(resolve, 8_000));
-		expect([
-			existsSync(paths.socket),
-			(await listServers()).some(({ project: root }) => root === current.root),
-		]).toEqual([false, false]);
-	} finally {
-		delete process.env.SIGHTREAD_START_TIMEOUT_MS;
-		delete process.env.SIGHTREAD_DAEMON_START_DELAY_MS;
-		disposable.cleanup();
-	}
-}, 45_000);
-
-test("an earlier version's directory lock held by a live process is waited for, not removed", async () => {
-	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-legacy-")), "start.lock");
-	mkdirSync(path);
-	writeFileSync(join(path, "pid"), String(process.pid));
-	let held = false;
-	const taking = withStartLock(path, async () => {
-		held = true;
-	});
-	await new Promise((resolve) => setTimeout(resolve, 300));
-	expect([held, statSync(path).isDirectory()]).toEqual([false, true]);
-	// Its holder is gone: the directory's pid names a process that isn't running.
-	writeFileSync(join(path, "pid"), "2147483646");
-	await taking;
-	expect([held, statSync(path).isFile()]).toEqual([true, true]);
-}, 30_000);
-
-test("a daemon that finds its socket taken leaves the other's state alone", async () => {
+test("a second daemon for a project exits and leaves the first serving", async () => {
 	await stopAllServers();
 	const current = project(first.root);
-	const paths = serverPaths(current);
-	mkdirSync(paths.directory, { recursive: true });
-	rmSync(paths.socket, { force: true });
-	const other = createServer(() => undefined);
-	await new Promise<void>((resolve) => other.listen(paths.socket, resolve));
-	const state = JSON.stringify({
-		project: current.root,
-		tsconfig: current.tsconfig,
-		pid: 1,
-		lastUsed: 0,
-		startedAt: 0,
-	});
-	writeFileSync(paths.state, state);
-	try {
-		const daemon = Bun.spawn(
-			[process.execPath, join(import.meta.dir, "../src/cli.ts"), "--daemon", current.root, current.tsconfig],
-			{
-				cwd: current.root,
-				env: { ...Bun.env, XDG_RUNTIME_DIR: runtime },
-				stdout: "pipe",
-				stderr: "pipe",
-			},
-		);
-		expect(await daemon.exited).not.toBe(0);
-		expect(readFileSync(paths.state, "utf8")).toBe(state);
-	} finally {
-		other.close();
-		rmSync(paths.state, { force: true });
-	}
+	const running = await connect(current);
+	const daemon = Bun.spawn(
+		[process.execPath, join(import.meta.dir, "../src/cli.ts"), "--daemon", current.root, current.tsconfig],
+		{ cwd: current.root, env: { ...Bun.env, XDG_RUNTIME_DIR: runtime }, stdout: "pipe", stderr: "pipe" },
+	);
+	expect(await daemon.exited).not.toBe(0);
+	expect(await new Response(daemon.stderr).text()).toContain("another server holds this project's lock");
+	const again = await connect(current);
+	expect(again.pid).toBe(running.pid);
+	expect(await again.query(lookup("greet"), {})).toContain("greet  exported function  src/model.ts:1-1");
 }, 45_000);

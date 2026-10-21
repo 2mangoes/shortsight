@@ -1,12 +1,12 @@
 // Find or start a project daemon and exchange one JSON message per socket connection.
 import { spawn, type ChildProcess } from "node:child_process";
-import { open, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { open, readdir } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import type { Project } from "../project.ts";
 import type { RequestType } from "../upstream.ts";
 import { lockHeld, withStartLock } from "./lock.ts";
-import { serverPaths, stateParent, type ServerPaths } from "./paths.ts";
+import { serverPaths, serverPathsIn, stateParent, type ServerPaths } from "./paths.ts";
 import { projectSignature } from "./signature.ts";
 
 export interface ServerConnection {
@@ -108,58 +108,40 @@ async function ping(paths: ServerPaths): Promise<Ping | undefined> {
 	return "live" in found ? found.live : undefined;
 }
 
-// The process a server's state names, when it's still running.
-const stateOwner = async (paths: ServerPaths) => {
-	const state = await readFile(paths.state, "utf8")
-		.then((text) => JSON.parse(text) as { pid?: number })
-		.catch(() => undefined);
-	return state?.pid && pidAlive(state.pid) ? state.pid : undefined;
-};
-
-// Stop a project's server and remove its files, but only once it has gone: a server that doesn't answer, while the
-// process its state names still runs, is reported rather than treated as stopped, so a second can't start beside it.
-async function stopAt(paths: ServerPaths, quietOnly = false): Promise<void> {
-	const found = await probe(paths);
-	if ("unresponsive" in found && (await stateOwner(paths)))
-		throw new ServerStopError(`server is not responding; see ${paths.log}`);
-	if ("live" in found) {
-		try {
-			if ((await exchange(paths.socket, { type: "stop", quietOnly }, 5_000)) === false) return;
-		} catch (error) {
-			if (error instanceof SocketTimeoutError) throw new ServerStopError(`server did not stop; see ${paths.log}`);
-			/* It may have exited already. */
-		}
-		// Gone means its process has exited, not that it stopped answering.
-		for (let index = 0; index < 50 && pidAlive(found.live.pid); index++) await pause(100);
-		if (pidAlive(found.live.pid)) throw new ServerStopError(`server did not stop; see ${paths.log}`);
-	}
-	await unlink(paths.socket).catch(() => undefined);
-	await unlink(paths.state).catch(() => undefined);
+// Whether the project's daemon, which holds its lock until it exits, is gone within five seconds.
+async function gone(paths: ServerPaths): Promise<boolean> {
+	for (let index = 0; index < 50 && lockHeld(paths.lock); index++) await pause(100);
+	return !lockHeld(paths.lock);
 }
 
-async function allStateDirectories(): Promise<string[]> {
+// Stop a project's server. One that holds its lock without answering, past the moment it takes to finish stopping, is
+// reported, not taken for stopped.
+async function stopAt(paths: ServerPaths, quietOnly = false): Promise<void> {
+	const found = await probe(paths);
+	if (!("live" in found)) {
+		if (await gone(paths)) return;
+		throw new ServerStopError(
+			"unresponsive" in found ? `server is not responding; see ${paths.log}` : "server is still starting; retry",
+		);
+	}
+	try {
+		if ((await exchange(paths.socket, { type: "stop", quietOnly }, 5_000)) === false) return;
+	} catch (error) {
+		if (error instanceof SocketTimeoutError) throw new ServerStopError(`server did not stop; see ${paths.log}`);
+		/* It may have exited already. */
+	}
+	if (!(await gone(paths))) throw new ServerStopError(`server did not stop; see ${paths.log}`);
+}
+
+async function allServerPaths(): Promise<ServerPaths[]> {
 	try {
 		const entries = await readdir(stateParent(), { withFileTypes: true });
-		return entries.filter((entry) => entry.isDirectory()).map((entry) => join(stateParent(), entry.name));
+		return entries
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => serverPathsIn(join(stateParent(), entry.name)));
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw error;
-	}
-}
-
-async function pathFromDirectory(directory: string): Promise<ServerPaths | undefined> {
-	try {
-		const state = JSON.parse(await readFile(join(directory, "state.json"), "utf8")) as {
-			project: string;
-			tsconfig?: string;
-		};
-		const paths = serverPaths({
-			root: state.project,
-			tsconfig: state.tsconfig ?? join(state.project, "tsconfig.json"),
-		});
-		return paths.directory === directory ? paths : undefined;
-	} catch {
-		return undefined;
 	}
 }
 
@@ -171,20 +153,7 @@ export function onServerStart(announce: (project: Project) => void): void {
 	announceStart = announce;
 }
 
-function pidAlive(pid: number): boolean {
-	if (!Number.isInteger(pid) || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-// A server that's starting holds its project's lock.
-async function startingLockAlive(paths: ServerPaths): Promise<boolean> {
-	return lockHeld(paths.lock);
-}
+const exited = (child: ChildProcess) => child.exitCode !== null || child.signalCode !== null;
 
 // Each graph server holds a whole program in memory (400–900 MB on large repositories), so keep few running.
 // Only quiet servers make room: agents in parallel worktrees never stop each other's servers or wait for a slot,
@@ -194,108 +163,65 @@ async function evictQuiet(current: string): Promise<void> {
 	const configured = Number(process.env.SIGHTREAD_QUIET_MS);
 	const quiet = process.env.SIGHTREAD_QUIET_MS && Number.isFinite(configured) ? configured : 5 * 60_000;
 	const servers: { paths: ServerPaths; lastUsed: number; active: number }[] = [];
-	let reservations = 0;
-	for (const directory of await allStateDirectories()) {
-		if (directory === current) continue;
-		const paths = await pathFromDirectory(directory);
-		if (!paths) continue;
-		if (await startingLockAlive(paths)) {
-			reservations++;
-			continue;
-		}
-		let state: { state?: string; pid?: number; startedAt?: number } | undefined;
-		try {
-			state = JSON.parse(await readFile(paths.state, "utf8")) as { state?: string; pid?: number; startedAt?: number };
-			if (state.state === "starting") {
-				if (
-					typeof state.startedAt === "number" &&
-					Date.now() - state.startedAt < startTimeout &&
-					pidAlive(state.pid ?? 0)
-				) {
-					reservations++;
-					continue;
-				}
-				await unlink(paths.state).catch(() => undefined);
-				continue;
-			}
-		} catch {
-			// A daemon may replace its reservation while we inspect it.
-		}
+	let starting = 0;
+	for (const paths of await allServerPaths()) {
+		if (paths.directory === current) continue;
 		const live = await ping(paths);
 		if (live) servers.push({ paths, lastUsed: live.lastUsed, active: live.active });
-		else if (state?.startedAt && Date.now() - state.startedAt < startTimeout && pidAlive(state.pid ?? 0))
-			reservations++;
+		// One that holds its lock but doesn't answer yet is starting.
+		else if (lockHeld(paths.lock)) starting++;
 	}
-	const need = Math.max(0, servers.length + reservations - maximum + 1);
+	const need = Math.max(0, servers.length + starting - maximum + 1);
 	const idle = servers.filter((server) => server.active === 0 && Date.now() - server.lastUsed >= quiet);
 	for (const server of idle.toSorted((a, b) => a.lastUsed - b.lastUsed).slice(0, need))
 		await stopAt(server.paths, true);
 }
 
-async function start(paths: ServerPaths, project: Project, signature: string): Promise<Ping> {
-	announceStart?.(project);
-	await withStartLock(join(paths.parent, "start.lock"), async () => {
-		await evictQuiet(paths.directory);
-		await writeFile(
-			paths.state,
-			JSON.stringify({
-				state: "starting",
-				project: project.root,
-				tsconfig: project.tsconfig,
-				pid: process.pid,
-				startedAt: Date.now(),
-				lastUsed: Date.now(),
-				signature,
-			}),
-		);
-	});
-	await rm(paths.socket, { force: true });
-	const log = await open(paths.log, "a");
-	let spawned: ChildProcess;
-	try {
-		const child = spawn(
-			process.execPath,
-			[join(import.meta.dir, "../cli.ts"), "--daemon", project.root, project.tsconfig],
-			{
-				cwd: project.root,
-				detached: true,
-				stdio: ["ignore", log.fd, log.fd],
-			},
-		);
-		await new Promise<void>((resolve, reject) => {
-			child.once("error", reject);
-			child.once("spawn", resolve);
-		});
-		child.unref();
-		spawned = child;
-	} finally {
-		await log.close();
-	}
-	const exited = () => spawned.exitCode !== null || spawned.signalCode !== null;
-	// Wait until a deadline, not for a number of pings, each of which can take a second; and no longer once the daemon
-	// has exited.
-	const deadline =
-		Date.now() +
-		(process.env.SIGHTREAD_DAEMON_FAIL === "1" ? 500 : Number(process.env.SIGHTREAD_START_TIMEOUT_MS) || startTimeout);
-	while (Date.now() < deadline && !exited()) {
+// Wait for the project's server to answer with `signature`: one `child` is starting, or one already holding the lock.
+// There's none once nothing holds the lock and `child`, if any, has exited.
+async function answer(paths: ServerPaths, signature: string, child?: ChildProcess): Promise<Ping | undefined> {
+	const deadline = Date.now() + startTimeout;
+	while (Date.now() < deadline) {
 		const live = await ping(paths);
 		if (live?.signature === signature) return live;
+		if (!lockHeld(paths.lock) && (!child || exited(child))) return undefined;
 		await pause(100);
 	}
-	// It didn't start: stop it and what it started, so it can't take the socket after this gives up its place.
-	if (!exited() && spawned.pid) {
+	return undefined;
+}
+
+async function start(paths: ServerPaths, project: Project, signature: string): Promise<Ping> {
+	announceStart?.(project);
+	// Starts are counted against the limit once their daemons hold their locks, so each waits for that before the
+	// next start counts.
+	const daemon = await withStartLock(join(paths.parent, "starting.lock"), async () => {
+		await evictQuiet(paths.directory);
+		const log = await open(paths.log, "a");
 		try {
-			process.kill(-spawned.pid, "SIGKILL");
-		} catch {
-			/* Already gone. */
+			const child = spawn(
+				process.execPath,
+				[join(import.meta.dir, "../cli.ts"), "--daemon", project.root, project.tsconfig],
+				{
+					cwd: project.root,
+					detached: true,
+					stdio: ["ignore", log.fd, log.fd],
+				},
+			);
+			await new Promise<void>((resolve, reject) => {
+				child.once("error", reject);
+				child.once("spawn", resolve);
+			});
+			child.unref();
+			const until = Date.now() + 10_000;
+			while (!exited(child) && !lockHeld(paths.lock) && Date.now() < until) await pause(25);
+			return child;
+		} finally {
+			await log.close();
 		}
-		for (let index = 0; index < 50 && pidAlive(spawned.pid); index++) await pause(100);
-	}
-	const owner = await readFile(paths.state, "utf8")
-		.then((text) => (JSON.parse(text) as { pid?: number }).pid)
-		.catch(() => undefined);
-	if (owner === process.pid || owner === spawned.pid) await unlink(paths.state).catch(() => undefined);
-	throw new Error(`server did not start; see ${paths.log}`);
+	});
+	const live = await answer(paths, signature, daemon);
+	if (!live) throw new Error(`server did not start; see ${paths.log}`);
+	return live;
 }
 
 function connection(project: Project, live: Ping, paths: ServerPaths): ServerConnection {
@@ -316,9 +242,7 @@ function connection(project: Project, live: Ping, paths: ServerPaths): ServerCon
 		values: (requests) => retry<unknown[]>({ type: "values", requests }),
 		requestTypes: () => retry<RequestType[]>({ type: "help" }),
 		restart: async () => {
-			await withStartLock(paths.lock, async () => {
-				await stopAt(paths);
-			});
+			await withStartLock(paths.start, () => stopAt(paths));
 			return connect(project);
 		},
 	};
@@ -328,13 +252,18 @@ function connection(project: Project, live: Ping, paths: ServerPaths): ServerCon
 export async function connect(project: Project): Promise<ServerConnection> {
 	const paths = serverPaths(project);
 	const signature = await projectSignature(project);
+	const matches = (live?: Ping) => live?.signature === signature && live.project === project.root;
 	const existing = await ping(paths);
-	if (existing?.signature === signature && existing.project === project.root)
-		return connection(project, existing, paths);
-	const live = await withStartLock(paths.lock, async () => {
-		const locked = await ping(paths);
-		if (locked?.signature === signature && locked.project === project.root) return locked;
-		await stopAt(paths);
+	if (matches(existing)) return connection(project, existing!, paths);
+	const live = await withStartLock(paths.start, async () => {
+		const found = await ping(paths);
+		if (matches(found)) return found!;
+		if (found) await stopAt(paths);
+		else if (lockHeld(paths.lock)) {
+			// One that holds the lock without answering is starting, as one whose client was stopped, or stopping.
+			const answered = await answer(paths, signature);
+			if (answered) return answered;
+		}
 		return start(paths, project, signature);
 	});
 	return connection(project, live, paths);
@@ -342,9 +271,7 @@ export async function connect(project: Project): Promise<ServerConnection> {
 
 export async function listServers(): Promise<Array<{ pid: number; project: string; lastUsed: number }>> {
 	const result: Array<{ pid: number; project: string; lastUsed: number }> = [];
-	for (const directory of await allStateDirectories()) {
-		const paths = await pathFromDirectory(directory);
-		if (!paths) continue;
+	for (const paths of await allServerPaths()) {
 		const live = await ping(paths);
 		if (live) result.push({ pid: live.pid, project: live.project, lastUsed: live.lastUsed });
 	}
@@ -353,12 +280,9 @@ export async function listServers(): Promise<Array<{ pid: number; project: strin
 
 export async function stopServer(project: Project): Promise<void> {
 	const paths = serverPaths(project);
-	await withStartLock(paths.lock, () => stopAt(paths));
+	await withStartLock(paths.start, () => stopAt(paths));
 }
 
 export async function stopAllServers(): Promise<void> {
-	for (const directory of await allStateDirectories()) {
-		const paths = await pathFromDirectory(directory);
-		if (paths) await withStartLock(paths.lock, () => stopAt(paths));
-	}
+	for (const paths of await allServerPaths()) await withStartLock(paths.start, () => stopAt(paths));
 }

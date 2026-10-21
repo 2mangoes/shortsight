@@ -1,7 +1,5 @@
 // Hold the graph and range cache behind a Unix socket.
-import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { readFile, rename, stat, writeFile, unlink } from "node:fs/promises";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join, relative, sep } from "node:path";
 import { nestedProjects, projectFiles, type Project } from "../project.ts";
@@ -10,6 +8,7 @@ import { runQuery } from "../query.ts";
 import { createRangeIndex } from "../ranges.ts";
 import { createReferenceIndex } from "../references.ts";
 import { RequestError, startGraphClient } from "../upstream.ts";
+import { holdLock } from "./lock.ts";
 import { serverPaths } from "./paths.ts";
 import { projectSignature } from "./signature.ts";
 
@@ -30,18 +29,15 @@ function duration(name: string, fallback: number): number {
 }
 
 /** Run until stopped, idle, or the project disappears. */
-// A file's device and inode, which a new file at the same path doesn't share.
-const identity = (path: string) =>
-	stat(path).then(
-		(found) => `${found.dev}:${found.ino}`,
-		() => undefined,
-	);
-
 export async function runDaemon(project: Project): Promise<void> {
 	if (process.env.SIGHTREAD_DAEMON_FAIL === "1") throw new Error("test daemon startup failure");
+	const paths = serverPaths(project);
+	mkdirSync(paths.directory, { recursive: true });
+	// Held until this process exits, so only this daemon ever creates or removes the project's socket: a
+	// second one started beside it stops here.
+	if (!holdLock(paths.lock)) throw new Error("another server holds this project's lock");
 	if (process.env.SIGHTREAD_DAEMON_START_DELAY_MS) await Bun.sleep(duration("SIGHTREAD_DAEMON_START_DELAY_MS", 0));
 	const startedAt = Date.now();
-	const paths = serverPaths(project);
 	const signature = await projectSignature(project);
 	const client = await startGraphClient(project, { stderr: 2, cacheDirectory: join(paths.directory, "ttsc-cache") });
 	// The graph covers sibling packages in the same repository, so their ranges are read too.
@@ -77,59 +73,11 @@ export async function runDaemon(project: Project): Promise<void> {
 		});
 	});
 
-	// The socket this daemon listens on, by device and inode: a replacement started while this one finishes its last
-	// queries listens on a new file at the same path, which isn't this daemon's to remove.
-	let socketIdentity: string | undefined;
-	async function removeOwnFiles(): Promise<void> {
-		if (socketIdentity && (await identity(paths.socket)) === socketIdentity)
-			await unlink(paths.socket).catch(() => undefined);
-		const state = await readFile(paths.state, "utf8")
-			.then((text) => JSON.parse(text) as { pid?: number })
-			.catch(() => undefined);
-		if (state?.pid === process.pid) await unlink(paths.state).catch(() => undefined);
-	}
-
-	// State writes still in flight, which shutdown waits for before a replacement can start.
-	const writing = new Set<Promise<void>>();
-	function writeState(): Promise<void> {
-		const write = publishState().finally(() => writing.delete(write));
-		writing.add(write);
-		return write;
-	}
-	async function publishState(): Promise<void> {
-		// Once closing, the state path may soon be a replacement's.
-		if (closing) return;
-		const temporary = `${paths.state}.${randomUUID()}`;
-		await writeFile(
-			temporary,
-			JSON.stringify({
-				project: project.root,
-				tsconfig: project.tsconfig,
-				pid: process.pid,
-				lastUsed,
-				startedAt,
-				signature,
-			}),
-		);
-		if (process.env.SIGHTREAD_DAEMON_STATE_DELAY_MS) await Bun.sleep(duration("SIGHTREAD_DAEMON_STATE_DELAY_MS", 0));
-		// Checked again with nothing awaited before the rename, so a write that began before shutdown either lands
-		// before it releases the socket or not at all.
-		if (closing) {
-			await unlink(temporary).catch(() => undefined);
-			return;
-		}
-		await rename(temporary, paths.state);
-	}
-
 	async function shutdown(): Promise<void> {
 		if (closing) return;
 		closing = true;
 		clearInterval(interval);
-		await Promise.allSettled(writing);
-		// Bun's close removes whatever file is at the socket's path. A socket a replacement has put there is left alone:
-		// nothing reaches this daemon through it, so the listener only stops keeping the process alive.
-		if ((await identity(paths.socket)) === socketIdentity) server.close();
-		else server.unref();
+		server.close();
 		// Running queries finish first, for up to half a minute: one stuck on a process that has stopped answering
 		// doesn't keep the daemon from stopping.
 		if (active > 0) {
@@ -146,7 +94,7 @@ export async function runDaemon(project: Project): Promise<void> {
 		} finally {
 			await ranges.close();
 			await references.close();
-			await removeOwnFiles();
+			rmSync(paths.socket, { force: true });
 		}
 	}
 
@@ -155,10 +103,7 @@ export async function runDaemon(project: Project): Promise<void> {
 		let stop = false;
 		try {
 			const message = JSON.parse(raw) as Message;
-			if (message.type !== "ping" && message.type !== "stop") {
-				lastUsed = Date.now();
-				await writeState();
-			}
+			if (message.type !== "ping" && message.type !== "stop") lastUsed = Date.now();
 			let value: unknown;
 			switch (message.type) {
 				case "ping":
@@ -216,10 +161,7 @@ export async function runDaemon(project: Project): Promise<void> {
 				default:
 					throw new Error("unknown server message");
 			}
-			if (message.type !== "ping" && message.type !== "stop") {
-				lastUsed = Date.now();
-				await writeState();
-			}
+			if (message.type !== "ping" && message.type !== "stop") lastUsed = Date.now();
 			if (!socket.destroyed) socket.end(`${JSON.stringify({ value })}\n`);
 		} catch (error) {
 			if (!socket.destroyed)
@@ -241,6 +183,8 @@ export async function runDaemon(project: Project): Promise<void> {
 		process.exitCode = 1;
 	});
 	try {
+		// A socket left by a daemon that was killed.
+		rmSync(paths.socket, { force: true });
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(paths.socket, () => {
@@ -248,16 +192,12 @@ export async function runDaemon(project: Project): Promise<void> {
 				resolve();
 			});
 		});
-		socketIdentity = await identity(paths.socket);
-		// Published only once listening: a daemon that finds another already on the socket mustn't have replaced its
-		// state, which its cleanup would then remove.
-		await writeState();
 	} catch (error) {
 		clearInterval(interval);
 		await client.close();
 		await ranges.close();
 		await references.close();
-		await removeOwnFiles();
+		rmSync(paths.socket, { force: true });
 		throw error;
 	}
 }
