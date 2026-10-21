@@ -224,6 +224,8 @@ export function createRangeIndex(root: string, options: { maxFiles?: number; wit
 			const cached = cache.get(absolute);
 			if (cached?.mtimeMs === metadata.mtimeMs && cached.size === metadata.size) return cached.declarations;
 			const text = await readFile(absolute, "utf8");
+			// Once closing, no new parser starts.
+			if (closed) return undefined;
 			parser ??= createDeclarationParser();
 			const parsed = await parser.parse(file, text);
 			cache.delete(absolute);
@@ -271,8 +273,10 @@ export function createRangeIndex(root: string, options: { maxFiles?: number; wit
 		},
 		async close() {
 			closed = true;
-			await Promise.all(inFlight.values());
+			// The parser closes first, so a read waiting on a process that has stopped answering is released, not waited
+			// for until its request times out.
 			await parser?.close();
+			await Promise.allSettled(inFlight.values());
 			cache.clear();
 		},
 	};

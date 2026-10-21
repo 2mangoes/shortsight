@@ -755,6 +755,8 @@ test("the reference index starts again when its process exits between queries", 
 				.stdout.toString()
 				.trim(),
 		);
+		// A failed lookup would be 0, which signals the whole process group.
+		expect(Number.isInteger(pid) && pid > 0).toBe(true);
 		process.kill(pid, "SIGKILL");
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		expect(await lines()).toEqual([2]);
@@ -788,6 +790,35 @@ test("references see a file an import names in a directory created empty since",
 			'import { target } from "../../main.js";\nexport const extra = () => target();\n',
 		);
 		expect(users()).toContain("lib/new/extra.ts");
+	} finally {
+		runIn(project, "stop");
+	}
+});
+
+test("references see a file an import names in a directory beside the project's own", () => {
+	const project = join(repository, "new-import-beside");
+	mkdirSync(join(project, "src"), { recursive: true });
+	writeFileSync(
+		join(project, "tsconfig.json"),
+		'{"compilerOptions":{"strict":true,"module":"nodenext"},"files":["src/main.ts"]}\n',
+	);
+	writeFileSync(join(project, "src/main.ts"), 'import "../lib/extra.js";\nexport function target() { return 1; }\n');
+	const users = () =>
+		(
+			JSON.parse(
+				runIn(project, "--json", JSON.stringify({ type: "references", symbol: "src/main.ts#target:function" })).out,
+			) as Array<{
+				nodes: Array<{ file: string }>;
+			}>
+		)[0]!.nodes.map(({ file }) => file);
+	try {
+		expect(users()).toEqual([]);
+		mkdirSync(join(project, "lib"));
+		writeFileSync(
+			join(project, "lib/extra.ts"),
+			'import { target } from "../src/main.js";\nexport const extra = () => target();\n',
+		);
+		expect(users()).toContain("lib/extra.ts");
 	} finally {
 		runIn(project, "stop");
 	}

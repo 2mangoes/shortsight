@@ -2,34 +2,13 @@
 import { programFiles, type Project } from "../project.ts";
 import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { createPaths } from "../paths.ts";
 import { createDeclarationParser } from "../ranges.ts";
 import { matchChanges } from "./changes.ts";
 import { readGitChanges } from "./git.ts";
-import { collectImpact } from "./impact.ts";
+import { collectImpact, importPaths, importsFile } from "./impact.ts";
 import { formatDiffNotes, renderDiffText, type DiffResult } from "./render.ts";
-
-// A path without its script extension, as an import names it: `../lib/shared.js` and `../lib/shared.ts` are one.
-const bare = (path: string) => path.replace(/\.(?:d\.)?[cm]?[jt]sx?$/, "");
-const SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
-
-// The files the program's files import by a relative path, without extensions, so a file that's been deleted, which
-// the program can no longer load, is still known to be the project's when something it holds still imports it.
-async function importedPaths(files: Iterable<string>): Promise<Set<string>> {
-	const imported = new Set<string>();
-	await Promise.all(
-		[...files].map(async (file) => {
-			const text = await readFile(file, "utf8").catch(() => "");
-			for (const [, specifier] of text.matchAll(SPECIFIER)) {
-				const target = bare(resolve(dirname(file), specifier!));
-				imported.add(realOrSelf(dirname(target)) + target.slice(dirname(target).length));
-				imported.add(`${target}/index`);
-			}
-		}),
-	);
-	return imported;
-}
 
 const realOrSelf = (file: string) => {
 	try {
@@ -54,9 +33,26 @@ export async function runDiff(
 		const files = await programFiles(project);
 		// Git names files by their real paths; the program may name them through a symlink, as /tmp on macOS.
 		const real = new Set([...files].map((file) => realOrSelf(file)));
-		const imported = await importedPaths(files);
-		// A deleted file isn't in the program any more; it was if something still imports it.
-		const importedFile = (absolute: string) => imported.has(bare(absolute));
+		// A deleted file isn't in the program any more; it was if something the program holds still imports it, by a
+		// relative path or through the config's paths.
+		const config = await importPaths(project);
+		const root = realOrSelf(project.root);
+		const sources = await Promise.all(
+			[...files].map(async (file) => ({
+				importer: relative(root, realOrSelf(file)).split(sep).join("/"),
+				text: await readFile(file, "utf8").catch(() => ""),
+			})),
+		);
+		const importedBefore = new Map<string, boolean>();
+		const importedFile = (absolute: string) => {
+			const target = relative(root, absolute).split(sep).join("/");
+			let found = importedBefore.get(target);
+			if (found === undefined) {
+				found = sources.some(({ importer, text }) => importsFile(text, importer, target, config));
+				importedBefore.set(target, found);
+			}
+			return found;
+		};
 		const matched = await matchChanges(
 			git,
 			project.root,
@@ -70,8 +66,7 @@ export async function runDiff(
 			(file.status === "deleted" &&
 				!isAbsolute(node.file) &&
 				!node.file.split("/").includes("node_modules") &&
-				(!node.file.startsWith("../") ||
-					importedFile(realOrSelf(dirname(resolve(project.root, node.file))) + "/" + node.file.split("/").pop())));
+				(!node.file.startsWith("../") || importedFile(resolve(root, node.file))));
 		const outside = matched.changed.filter((change) => !inProject(change));
 		matched.changed = matched.changed.filter(inProject);
 		if (outside.length)

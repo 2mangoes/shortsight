@@ -196,8 +196,11 @@ export async function readGitChanges(projectRoot: string, base?: string): Promis
 		async baseText(file) {
 			try {
 				return await git(repository, ["show", `${revision}:${file}`]);
-			} catch {
-				return undefined;
+			} catch (error) {
+				// Git exiting with an error means the base doesn't have the file. A Git that was stopped, overflowed its
+				// output or never ran isn't an answer of absence.
+				if (typeof (error as { code?: unknown }).code === "number") return undefined;
+				throw error;
 			}
 		},
 		async grep(name) {
@@ -219,8 +222,10 @@ export async function readGitChanges(projectRoot: string, base?: string): Promis
 					const match = separator < 0 ? undefined : /^(\d+)\0/.exec(entry.slice(separator + 1));
 					return match ? [{ file: path(entry.slice(0, separator)), line: +match[1] }] : [];
 				});
-			} catch {
-				return [];
+			} catch (error) {
+				// git grep exits 1 when nothing matches; anything else is a failure, not an answer of none.
+				if ((error as { code?: unknown }).code === 1) return [];
+				throw error;
 			}
 		},
 	};

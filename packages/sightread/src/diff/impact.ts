@@ -64,7 +64,7 @@ interface ImportPaths {
 	paths: Record<string, string[]>;
 }
 
-async function importPaths(project: Project): Promise<ImportPaths> {
+export async function importPaths(project: Project): Promise<ImportPaths> {
 	const api = new API({ cwd: project.root });
 	try {
 		const { options } = await untilExit(api, api.parseConfigFile(project.tsconfig));
@@ -104,7 +104,7 @@ function matchesModule(resolved: string, target: string): boolean {
 	);
 }
 
-function importsFile(source: string, importer: string, target: string, config: ImportPaths): boolean {
+export function importsFile(source: string, importer: string, target: string, config: ImportPaths): boolean {
 	const statements = /\b(?:import|export)\b[^;]*?\bfrom\s*['"]([^'"]+)['"]|\bimport\s*['"]([^'"]+)['"]/g;
 	for (const match of source.matchAll(statements)) {
 		const specifier = match[1] ?? match[2];

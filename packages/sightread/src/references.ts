@@ -1,7 +1,7 @@
 // Find every compiler-resolved use of a graph symbol in the project's real files.
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { realpathSync } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { API, type Snapshot, SymbolFlags } from "typescript/unstable/async";
 import {
 	getTouchingPropertyName,
@@ -158,6 +158,42 @@ async function listing(directory: string): Promise<Listing | undefined> {
 	return { stamp: found.mtimeMs, entries: new Set(entries) };
 }
 
+// A relative import's specifier, from `import`, `export … from`, a dynamic `import()` or `require()`.
+const SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
+const EXTENSIONS = ["", ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json"];
+
+const exists = (path: string) =>
+	stat(path).then(
+		() => true,
+		() => false,
+	);
+
+// The nearest existing directory above each file the program's relative imports name that doesn't exist yet, so
+// one created there, or in a directory created there, is seen: an import TypeScript couldn't resolve has no file to
+// watch.
+async function unresolvedImportDirectories(files: Iterable<string>): Promise<Set<string>> {
+	const found = new Set<string>();
+	await Promise.all(
+		[...files].map(async (file) => {
+			const text = await readFile(file, "utf8").catch(() => "");
+			for (const [, specifier] of text.matchAll(SPECIFIER)) {
+				const target = resolve(dirname(file), specifier!);
+				const base = target.replace(/\.(?:[cm]?[jt]sx?)$/, "");
+				const candidates = [
+					target,
+					...EXTENSIONS.map((extension) => base + extension),
+					...EXTENSIONS.map((extension) => join(target, `index${extension || ".ts"}`)),
+				];
+				if ((await Promise.all(candidates.map(exists))).some(Boolean)) continue;
+				let directory = dirname(target);
+				while (!(await exists(directory)) && dirname(directory) !== directory) directory = dirname(directory);
+				found.add(directory);
+			}
+		}),
+	);
+	return found;
+}
+
 // Every directory under one, outside node_modules and hidden ones, itself included.
 async function directoriesUnder(directory: string): Promise<string[]> {
 	const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
@@ -243,6 +279,13 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 						const found = await listing(under);
 						if (found) listings.set(under, found);
 					}
+		// Where a relative import names a file that isn't there yet, the directory it would appear in, or the nearest
+		// above it that exists: watched on its own, since what's under it isn't the project's.
+		for (const directory of await unresolvedImportDirectories(loaded))
+			if (!listings.has(directory)) {
+				const found = await listing(directory);
+				if (found) listings.set(directory, found);
+			}
 		if (previous) {
 			api.clearSourceFileCache();
 			await previous.dispose();

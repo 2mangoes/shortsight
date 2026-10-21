@@ -241,7 +241,6 @@ export async function runDaemon(project: Project): Promise<void> {
 		process.exitCode = 1;
 	});
 	try {
-		await writeState();
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(paths.socket, () => {
@@ -250,6 +249,9 @@ export async function runDaemon(project: Project): Promise<void> {
 			});
 		});
 		socketIdentity = await identity(paths.socket);
+		// Published only once listening: a daemon that finds another already on the socket mustn't have replaced its
+		// state, which its cleanup would then remove.
+		await writeState();
 	} catch (error) {
 		clearInterval(interval);
 		await client.close();

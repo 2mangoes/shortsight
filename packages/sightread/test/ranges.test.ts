@@ -404,6 +404,8 @@ test("closing a parser whose process has stopped answering returns, and fails it
 			.stdout.toString()
 			.trim(),
 	);
+	// A failed lookup would be 0, which signals the whole process group.
+	expect(Number.isInteger(pid) && pid > 0).toBe(true);
 	process.kill(pid, "SIGSTOP");
 	const pending = parser.parse("second.ts", "export const Second = 2;").then(
 		() => "parsed",
@@ -426,4 +428,35 @@ test("closing a parser whose process has stopped answering returns, and fails it
 	};
 	for (let waited = 0; waited < 3_000 && alive(); waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
 	expect(alive()).toBe(false);
+}, 15_000);
+
+test("closing a range index whose parser has stopped answering returns, without waiting for its read", async () => {
+	const root = await project();
+	await writeFile(join(root, "first.ts"), "export const First = 1;");
+	await writeFile(join(root, "second.ts"), "export const Second = 2;");
+	const index = createRangeIndex(root);
+	expect((await index.declarations("first.ts"))?.[0]?.name).toBe("First");
+	const pid = Number(
+		Bun.spawnSync(["pgrep", "-n", "-P", String(process.pid), "-f", "__sightread_ranges_"])
+			.stdout.toString()
+			.trim(),
+	);
+	// A failed lookup would be 0, which signals the whole process group.
+	expect(Number.isInteger(pid) && pid > 0).toBe(true);
+	process.kill(pid, "SIGSTOP");
+	const reading = index.declarations("second.ts");
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	const started = Date.now();
+	await index.close();
+	expect(Date.now() - started).toBeLessThan(5_000);
+	await reading.catch(() => undefined);
+	for (let waited = 0; waited < 3_000; waited += 50) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			break;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	expect(() => process.kill(pid, 0)).toThrow();
 }, 15_000);

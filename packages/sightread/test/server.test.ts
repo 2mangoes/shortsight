@@ -809,3 +809,53 @@ test("a server that doesn't start in time is stopped, not left to take the socke
 		disposable.cleanup();
 	}
 }, 45_000);
+
+test("an earlier version's directory lock held by a live process is waited for, not removed", async () => {
+	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-legacy-")), "start.lock");
+	mkdirSync(path);
+	writeFileSync(join(path, "pid"), String(process.pid));
+	let held = false;
+	const taking = withStartLock(path, async () => {
+		held = true;
+	});
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	expect([held, statSync(path).isDirectory()]).toEqual([false, true]);
+	// Its holder is gone: the directory's pid names a process that isn't running.
+	writeFileSync(join(path, "pid"), "2147483646");
+	await taking;
+	expect([held, statSync(path).isFile()]).toEqual([true, true]);
+}, 30_000);
+
+test("a daemon that finds its socket taken leaves the other's state alone", async () => {
+	await stopAllServers();
+	const current = project(first.root);
+	const paths = serverPaths(current);
+	mkdirSync(paths.directory, { recursive: true });
+	rmSync(paths.socket, { force: true });
+	const other = createServer(() => undefined);
+	await new Promise<void>((resolve) => other.listen(paths.socket, resolve));
+	const state = JSON.stringify({
+		project: current.root,
+		tsconfig: current.tsconfig,
+		pid: 1,
+		lastUsed: 0,
+		startedAt: 0,
+	});
+	writeFileSync(paths.state, state);
+	try {
+		const daemon = Bun.spawn(
+			[process.execPath, join(import.meta.dir, "../src/cli.ts"), "--daemon", current.root, current.tsconfig],
+			{
+				cwd: current.root,
+				env: { ...Bun.env, XDG_RUNTIME_DIR: runtime },
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		expect(await daemon.exited).not.toBe(0);
+		expect(readFileSync(paths.state, "utf8")).toBe(state);
+	} finally {
+		other.close();
+		rmSync(paths.state, { force: true });
+	}
+}, 45_000);
