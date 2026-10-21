@@ -18,3 +18,7 @@ test("JSON with comments and trailing commas parses, and strings that look like 
 	expect(parseJSONC(text)).toEqual(Bun.JSONC.parse(text) as object);
 	expect(() => parseJSONC("{ not json }")).toThrow();
 });
+
+test("a byte-order mark before a tsconfig is ignored", () => {
+	expect(parseJSONC('\uFEFF{ "include": ["src"] }')).toEqual({ include: ["src"] });
+});

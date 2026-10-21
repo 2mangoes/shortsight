@@ -693,6 +693,22 @@ await withStartLock(${JSON.stringify(path)}, async () => { console.log("held"); 
 	expect(await lockHeld(path)).toBe(false);
 }, 30_000);
 
+test("the built package under Node and its source under Bun give a project one signature", async () => {
+	const built = Bun.spawnSync([
+		join(import.meta.dir, "../../../node_modules/.bin/tsc"),
+		"-p",
+		join(import.meta.dir, "../tsconfig.build.json"),
+	]);
+	expect(built.exitCode).toBe(0);
+	const signature = join(import.meta.dir, "../dist/server/signature.js");
+	const fromNode = Bun.spawnSync([
+		node,
+		"-e",
+		`const { projectSignature } = await import(${JSON.stringify(signature)}); console.log(await projectSignature(${JSON.stringify(project(first.root))}));`,
+	]);
+	expect(fromNode.stdout.toString().trim()).toBe(await projectSignature(project(first.root)));
+}, 30_000);
+
 test("a Node CLI and a Bun CLI starting together share one server", async () => {
 	await stopServer(project(first.root));
 	const request = JSON.stringify({ type: "lookup", query: "greet" });

@@ -8,7 +8,8 @@ export const scriptExtension = extname(import.meta.filename);
 /** Parse JSON with comments and trailing commas, as a tsconfig may have. */
 export function parseJSONC(text: string): unknown {
 	let json = "";
-	for (let index = 0; index < text.length; index++) {
+	// A byte-order mark, as some editors save, isn't JSON.
+	for (let index = text.startsWith("\uFEFF") ? 1 : 0; index < text.length; index++) {
 		const character = text[index];
 		const next = text[index + 1];
 		if (character === '"') {

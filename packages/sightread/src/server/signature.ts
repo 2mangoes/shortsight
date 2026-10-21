@@ -4,7 +4,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Project } from "../project.ts";
-import { parseJSONC, scriptExtension } from "../runtime.ts";
+import { parseJSONC } from "../runtime.ts";
 
 const require = createRequire(import.meta.url);
 const names = [
@@ -22,7 +22,8 @@ const versions = ["@ttsc/graph", "ttsc", "typescript"].map((name) => [
 	(require(`${name}/package.json`) as { version: string }).version,
 ]);
 const ownVersion = (require("../../package.json") as { version: string }).version;
-const sourceRoot = join(import.meta.dirname, "..");
+// The package's TypeScript source, which it ships whether it runs from it or from its build, so Node and Bun agree.
+const sourceRoot = join(import.meta.dirname, "../../src");
 
 async function sourceFiles(directory: string, prefix = ""): Promise<Array<[string, number, number]>> {
 	const entries = await readdir(directory, { withFileTypes: true });
@@ -31,7 +32,7 @@ async function sourceFiles(directory: string, prefix = ""): Promise<Array<[strin
 			const name = join(prefix, entry.name);
 			const path = join(directory, entry.name);
 			if (entry.isDirectory()) return sourceFiles(path, name);
-			if (!entry.isFile() || !entry.name.endsWith(scriptExtension)) return [];
+			if (!entry.isFile() || !entry.name.endsWith(".ts")) return [];
 			const info = await stat(path);
 			return [[name, info.mtimeMs, info.size] as [string, number, number]];
 		}),
