@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
-import { untilExit } from "../api.ts";
+import { closeAPI, untilExit } from "../api.ts";
 import { fromHandle, HOPS_PER_NODE, object, traceCut, type GraphNode } from "../model.ts";
 import type { Project } from "../project.ts";
 import { handleFor, indexedDeclarations, type Declaration, type DeclarationParser } from "../ranges.ts";
@@ -84,7 +84,7 @@ async function importPaths(project: Project): Promise<ImportPaths> {
 					: {},
 		};
 	} finally {
-		await api.close();
+		await closeAPI(api);
 	}
 }
 
@@ -139,20 +139,30 @@ function importsFile(source: string, importer: string, target: string, config: I
 	return false;
 }
 
+// A file's path relative to the project: `../` for a sibling package's that the program loads, or undefined for one
+// outside it.
+function projectFile(git: GitChanges, project: Project, file: string, inProgram: (absolute: string) => boolean) {
+	const local = git.projectPath(file);
+	if (!local.outside) return local.path;
+	const absolute = resolve(git.repository, file);
+	return inProgram(absolute) ? relative(realpathSync(project.root), absolute).split(sep).join("/") : undefined;
+}
+
 async function relevantHits(
 	git: GitChanges,
 	project: Project,
 	item: ChangedSymbol,
 	includeOwnFile: boolean,
 	config: ImportPaths,
+	inProgram: (absolute: string) => boolean,
 ): Promise<Array<{ file: string; line: number }>> {
+	// Each hit by its path relative to the project.
 	const hits = await git.grep(item.node.name.split(".").at(-1)!);
 	const sources = new Map<string, string>();
 	const relevant: Array<{ file: string; line: number }> = [];
 	for (const hit of hits) {
-		const local = git.projectPath(hit.file);
-		if (local.outside || !local.path || !/\.(?:ts|tsx|mts|cts)$/.test(local.path)) continue;
-		const file = local.path;
+		const file = projectFile(git, project, hit.file, inProgram);
+		if (!file || !/\.(?:ts|tsx|mts|cts)$/.test(file)) continue;
 		if (file === item.node.file && !includeOwnFile) continue;
 		let source = sources.get(file);
 		if (source === undefined) {
@@ -176,7 +186,7 @@ async function relevantHits(
 			.at(-1)!
 			.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		if (!new RegExp(`(?<![\\w$])${name}(?![\\w$])`).test(code)) continue;
-		relevant.push(hit);
+		relevant.push({ file, line: hit.line });
 	}
 	return relevant;
 }
@@ -407,16 +417,16 @@ async function deletedCallers(input: {
 	callerMap: Map<string, GraphNode>;
 	chains: Impact["chains"];
 	config: ImportPaths;
+	inProgram: (absolute: string) => boolean;
 }) {
-	const { git, project, parser, changed, getDeclarations, nodeFor, callerMap, chains, config } = input;
+	const { git, project, parser, changed, getDeclarations, nodeFor, callerMap, chains, config, inProgram } = input;
 	const changedHandles = new Set(changed.map(({ node }) => node.handle));
 	for (const item of changed.filter(({ node }) => node.status === "deleted" || node.status === "moved")) {
 		const old = await git.baseText(item.file.oldPath ?? item.file.path);
 		if (!old || !searchable(item, await parser.parse(item.node.file, old))) continue;
 		const found = new Set<string>();
-		for (const hit of await relevantHits(git, project, item, nodeStatusOwnFile(item), config)) {
-			const local = git.projectPath(hit.file);
-			if (local.outside || !local.path) continue;
+		for (const hit of await relevantHits(git, project, item, nodeStatusOwnFile(item), config, inProgram)) {
+			const local = { path: hit.file };
 			const decl = (await getDeclarations(local.path))
 				.filter(({ start, end }) => start <= hit.line && hit.line <= end)
 				.toSorted((a, b) => a.end - a.start - (b.end - b.start))[0];
@@ -447,17 +457,18 @@ async function testSites(input: {
 	getDeclarations: Lookup["getDeclarations"];
 	testMap: Map<string, GraphNode & { byName?: true }>;
 	config: ImportPaths;
+	inProgram: (absolute: string) => boolean;
 }) {
-	const { git, project, parser, changed, getDeclarations, testMap, config } = input;
+	const { git, project, parser, changed, getDeclarations, testMap, config, inProgram } = input;
 	for (const item of changed) {
 		const declarations =
 			item.node.status === "deleted"
 				? await parser.parse(item.node.file, (await git.baseText(item.file.oldPath ?? item.file.path)) ?? "")
 				: await getDeclarations(item.node.file);
 		if (!searchable(item, declarations)) continue;
-		for (const hit of await relevantHits(git, project, item, false, config)) {
-			const local = git.projectPath(hit.file);
-			if (local.outside || !local.path || !testFile(local.path)) continue;
+		for (const hit of await relevantHits(git, project, item, false, config, inProgram)) {
+			const local = { path: hit.file };
+			if (!testFile(local.path)) continue;
 			const key = `${local.path}:${hit.line}:${item.node.name}`;
 			if (testMap.has(key)) continue;
 			testMap.set(key, {
@@ -490,8 +501,20 @@ export async function collectImpact(
 	const reverseByIndex = await reverseFallback(active, values, server);
 	const config = await importPaths(project);
 	await graphChains({ active, changed, values, reverseByIndex, notes, callerMap, testMap, chains, nodeFor });
-	await deletedCallers({ git, project, parser, changed, getDeclarations, nodeFor, callerMap, chains, config });
-	await testSites({ git, project, parser, changed, getDeclarations, testMap, config });
+	const { inProgram } = matched;
+	await deletedCallers({
+		git,
+		project,
+		parser,
+		changed,
+		getDeclarations,
+		nodeFor,
+		callerMap,
+		chains,
+		config,
+		inProgram,
+	});
+	await testSites({ git, project, parser, changed, getDeclarations, testMap, config, inProgram });
 	const tests = [...testMap.values()].toSorted((a, b) => a.file.localeCompare(b.file) || a.site!.start - b.site!.start);
 	if (tests.length > 200) notes.push(`... ${tests.length - 200} more direct test sites`);
 	return {

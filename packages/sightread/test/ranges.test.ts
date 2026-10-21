@@ -395,3 +395,35 @@ test("a parse in flight when its process dies fails instead of waiting forever, 
 		await parser.close();
 	}
 }, 15_000);
+
+test("closing a parser whose process has stopped answering returns, and fails its parse in flight", async () => {
+	const parser = createDeclarationParser();
+	expect((await parser.parse("first.ts", "export const First = 1;"))[0]?.name).toBe("First");
+	const pid = Number(
+		Bun.spawnSync(["pgrep", "-n", "-P", String(process.pid), "-f", "__sightread_ranges_"])
+			.stdout.toString()
+			.trim(),
+	);
+	process.kill(pid, "SIGSTOP");
+	const pending = parser.parse("second.ts", "export const Second = 2;").then(
+		() => "parsed",
+		(error: Error) => error.message,
+	);
+	// The parse is sent before the parser closes.
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	const started = Date.now();
+	await parser.close();
+	expect(Date.now() - started).toBeLessThan(5_000);
+	expect(await pending).toBe("Range index is closed");
+	// Its process is gone, not left stopped: killed, then reaped.
+	const alive = () => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	for (let waited = 0; waited < 3_000 && alive(); waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
+	expect(alive()).toBe(false);
+}, 15_000);

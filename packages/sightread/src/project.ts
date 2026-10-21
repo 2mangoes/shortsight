@@ -2,7 +2,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { API, type Snapshot } from "typescript/unstable/async";
-import { untilExit } from "./api.ts";
+import { closeAPI, untilExit } from "./api.ts";
 
 export interface Project {
 	/** Absolute directory containing the tsconfig. */
@@ -26,7 +26,7 @@ export async function projectFiles(project: Project, shared?: API): Promise<Set<
 				.map((name) => resolve(name)),
 		);
 	} finally {
-		if (!shared) await api.close();
+		if (!shared) await closeAPI(api);
 	}
 }
 
@@ -55,7 +55,7 @@ export async function programFiles(project: Project): Promise<Set<string>> {
 			})(),
 		);
 	} finally {
-		await api.close();
+		await closeAPI(api);
 	}
 }
 
@@ -155,7 +155,7 @@ async function chosenConfig(solution: string, cwd: string): Promise<string> {
 		}
 		return best;
 	} finally {
-		await api.close();
+		await closeAPI(api);
 	}
 }
 

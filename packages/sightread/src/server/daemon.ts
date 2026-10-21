@@ -130,10 +130,17 @@ export async function runDaemon(project: Project): Promise<void> {
 		// nothing reaches this daemon through it, so the listener only stops keeping the process alive.
 		if ((await identity(paths.socket)) === socketIdentity) server.close();
 		else server.unref();
-		if (active > 0)
+		// Running queries finish first, for up to half a minute: one stuck on a process that has stopped answering
+		// doesn't keep the daemon from stopping.
+		if (active > 0) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
 			await new Promise<void>((resolve) => {
 				finishActive = resolve;
+				timer = setTimeout(resolve, 30_000);
 			});
+			// Cleared, so a timer left running doesn't keep the process alive after the queries finish.
+			clearTimeout(timer);
+		}
 		try {
 			await client.close();
 		} finally {

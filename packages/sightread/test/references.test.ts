@@ -3,6 +3,8 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { GraphResult } from "../src/model.ts";
+import { createPaths } from "../src/paths.ts";
+import { createReferenceIndex } from "../src/references.ts";
 import { renderText } from "../src/render.ts";
 import { createFixtureProject } from "./fixture.ts";
 
@@ -729,6 +731,63 @@ test("references see a file an import names in a directory that held none", () =
 			'import { target } from "../main.js";\nexport const extra = () => target();\n',
 		);
 		expect(users()).toContain("lib/extra.ts");
+	} finally {
+		runIn(project, "stop");
+	}
+});
+
+test("the reference index starts again when its process exits between queries", async () => {
+	const project = join(repository, "restart-index");
+	mkdirSync(project, { recursive: true });
+	writeFileSync(
+		join(project, "tsconfig.json"),
+		'{"compilerOptions":{"strict":true,"module":"nodenext"},"include":["*.ts"]}\n',
+	);
+	writeFileSync(join(project, "a.ts"), "export function target() { return 1; }\nexport const use = () => target();\n");
+	const index = createReferenceIndex({ root: project, tsconfig: join(project, "tsconfig.json") });
+	const paths = createPaths(project);
+	const lines = async () =>
+		(await index.query({ type: "references", symbol: "a.ts#target:function" }, paths)).nodes.map(({ line }) => line);
+	try {
+		expect(await lines()).toEqual([2]);
+		const pid = Number(
+			Bun.spawnSync(["pgrep", "-n", "-P", String(process.pid), "-f", "tsc --api --async --cwd"])
+				.stdout.toString()
+				.trim(),
+		);
+		process.kill(pid, "SIGKILL");
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(await lines()).toEqual([2]);
+	} finally {
+		await index.close();
+	}
+}, 30_000);
+
+test("references see a file an import names in a directory created empty since", () => {
+	const project = join(repository, "new-import-staged");
+	mkdirSync(join(project, "lib"), { recursive: true });
+	writeFileSync(
+		join(project, "tsconfig.json"),
+		'{"compilerOptions":{"strict":true,"module":"nodenext"},"files":["main.ts"]}\n',
+	);
+	writeFileSync(join(project, "main.ts"), 'import "./lib/new/extra.js";\nexport function target() { return 1; }\n');
+	const users = () =>
+		(
+			JSON.parse(
+				runIn(project, "--json", JSON.stringify({ type: "references", symbol: "main.ts#target:function" })).out,
+			) as Array<{
+				nodes: Array<{ file: string }>;
+			}>
+		)[0]!.nodes.map(({ file }) => file);
+	try {
+		expect(users()).toEqual([]);
+		mkdirSync(join(project, "lib/new"));
+		expect(users()).toEqual([]);
+		writeFileSync(
+			join(project, "lib/new/extra.ts"),
+			'import { target } from "../../main.js";\nexport const extra = () => target();\n',
+		);
+		expect(users()).toContain("lib/new/extra.ts");
 	} finally {
 		runIn(project, "stop");
 	}

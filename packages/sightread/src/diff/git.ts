@@ -7,16 +7,35 @@ import { relative, resolve, sep } from "node:path";
 const runFile = promisify(execFile);
 const types = ["*.ts", "*.tsx", "*.mts", "*.cts"];
 // User config can change prefixes, paths and colour in diff output, or hand it to another program; pin what the parser reads.
-const plainDiff = ["--no-ext-diff", "--no-color", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/"];
+// A textconv filter would turn the files into other text, so hunks wouldn't match their lines; it's left out too.
+const plainDiff = [
+	"--no-ext-diff",
+	"--no-textconv",
+	"--no-color",
+	"--no-relative",
+	"--src-prefix=a/",
+	"--dst-prefix=b/",
+];
 export const isTypeScript = (file: string) => /\.(?:ts|tsx|mts|cts)$/.test(file);
 
+// Git can run what the repository's config names, such as a filter, so a command that doesn't finish is stopped.
+const GIT_TIMEOUT = 60_000;
+
 async function git(cwd: string, args: string[]): Promise<string> {
-	const { stdout } = await runFile("git", ["-c", "core.quotePath=false", ...args], {
-		cwd,
-		encoding: "utf8",
-		maxBuffer: 32 * 1024 * 1024,
-	});
-	return stdout;
+	try {
+		const { stdout } = await runFile("git", ["-c", "core.quotePath=false", ...args], {
+			cwd,
+			encoding: "utf8",
+			maxBuffer: 32 * 1024 * 1024,
+			timeout: GIT_TIMEOUT,
+			killSignal: "SIGKILL",
+		});
+		return stdout;
+	} catch (error) {
+		if ((error as { killed?: boolean }).killed)
+			throw new Error(`git ${args[0]} didn't finish in ${GIT_TIMEOUT / 1000}s`, { cause: error });
+		throw error;
+	}
 }
 
 function path(value: string): string {

@@ -23,6 +23,8 @@ export interface MatchedChanges {
 	notes: string[];
 	files: Map<string, GitFile>;
 	current: Map<string, Declaration[]>;
+	/** Whether the project's program loads a file, given its absolute path, a sibling package's included. */
+	inProgram: (absolute: string) => boolean;
 }
 
 const key = (item: Declaration) => `${item.name}:${item.kind}`;
@@ -141,6 +143,7 @@ export async function matchChanges(
 	// An added or deleted declaration stands for its members, which changed with it.
 	const containers = changed.filter(({ node }) => node.status !== "edited");
 	return {
+		inProgram,
 		changed: changed.filter(
 			(symbol) =>
 				!memberSymbols.has(symbol) ||

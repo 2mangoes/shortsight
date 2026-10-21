@@ -937,3 +937,38 @@ test("callers the graph leaves out through a dispatch to 12 or more implementati
 	f.put("client/src/shape.ts", changed);
 	expect(await f.run()).toContain("Shape3.area: callers through a dispatch to 12 or more implementations left out");
 }, 30_000);
+
+test("a deleted sibling package's file the project imports is diffed, with callers in other packages", async () => {
+	const f = fixture({
+		"lib/shared.ts": "export function shared() {\n\treturn 1;\n}\n",
+		"other/use.ts": 'import { shared } from "../lib/shared.ts";\nexport function viaOther() {\n\treturn shared();\n}\n',
+		"client/src/app.ts":
+			'import { shared } from "../../lib/shared.ts";\nimport { viaOther } from "../../other/use.ts";\nexport const app = () => shared() + viaOther();\n',
+	});
+	f.put(
+		"client/tsconfig.json",
+		'{"compilerOptions":{"allowImportingTsExtensions":true,"noEmit":true,"module":"nodenext"},"include":["src"]}\n',
+	);
+	git(f.repo, "add", "client/tsconfig.json");
+	git(f.repo, "commit", "-qm", "only src is a root");
+	rmSync(join(f.repo, "lib/shared.ts"));
+	const output = await f.run();
+	expect(output).toContain("lib/shared.ts  (deleted file)\n  1-3  shared  deleted (base lines)");
+	expect(output).toContain("named in client/src/app.ts:3-3  app");
+	expect(output).toContain("named in other/use.ts:2-4  viaOther");
+}, 30_000);
+
+test("a textconv filter doesn't change the lines a diff attributes", async () => {
+	const f = fixture({
+		"client/src/values.ts": "export function a() {\n\treturn 1;\n}\nexport function b() {\n\treturn 2;\n}\n",
+	});
+	// A filter that drops every `export` line, so its hunks would put b's change on a's lines.
+	f.put("client/.gitattributes", "*.ts diff=dropper\n");
+	git(f.repo, "config", "diff.dropper.textconv", "grep -v export");
+	git(f.repo, "add", "client/.gitattributes");
+	git(f.repo, "commit", "-qm", "attributes");
+	f.put("client/src/values.ts", "export function a() {\n\treturn 1;\n}\nexport function b() {\n\treturn 3;\n}\n");
+	const output = await f.run();
+	expect(output).toContain("4-6  b  edited");
+	expect(output).not.toContain("  a  edited");
+}, 30_000);

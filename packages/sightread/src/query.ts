@@ -425,7 +425,10 @@ export async function runQuery(
 					if (traced) return traced;
 				}
 				const { value } = await context.client.query(item.request);
-				return item.request.type === "details" ? await withUnindexed(context.ranges, value) : { value };
+				// Raw output is the graph's own answer, without the declarations it has no node for.
+				return item.request.type === "details" && mode !== "raw"
+					? await withUnindexed(context.ranges, value)
+					: { value };
 			} catch (error) {
 				return { error: error instanceof Error ? error.message : String(error), cause: error };
 			}

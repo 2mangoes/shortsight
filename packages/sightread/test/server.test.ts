@@ -18,7 +18,7 @@ import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { connect, exchange, listServers, stopAllServers, stopServer } from "../src/server/client.ts";
-import { withStartLock } from "../src/server/lock.ts";
+import { lockHeld, withStartLock } from "../src/server/lock.ts";
 import { serverPaths, stateParent } from "../src/server/paths.ts";
 import { projectSignature } from "../src/server/signature.ts";
 
@@ -532,7 +532,7 @@ test("a cold start in one project does not block a warm query in another", async
 		return value;
 	});
 	try {
-		await until(async () => existsSync(serverPaths(project(first.root)).lock));
+		await until(async () => lockHeld(serverPaths(project(first.root)).lock));
 		const start = performance.now();
 		const output = await (await connect(project(second.root))).query(lookup("other"), {});
 		expect(output).toContain("other  exported function  src/other.ts:1-1");
@@ -665,26 +665,41 @@ test("a stopping daemon leaves a replacement's socket and state alone", async ()
 	}
 }, 45_000);
 
-test("starters reclaiming a dead holder's lock never hold it together", async () => {
-	const directory = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-")), "start.lock");
+test("starters never hold the start lock together, and a holder that dies frees it", async () => {
+	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-")), "start.lock");
 	let holding = 0;
 	let most = 0;
-	for (let round = 0; round < 5; round++) {
-		mkdirSync(directory);
-		// A process id that isn't running.
-		writeFileSync(join(directory, "pid"), "2147483646");
-		await Promise.all(
-			Array.from({ length: 20 }, () =>
-				withStartLock(directory, async () => {
-					most = Math.max(most, ++holding);
-					await new Promise((resolve) => setTimeout(resolve, 5));
-					holding--;
-				}),
-			),
-		);
-	}
+	await Promise.all(
+		Array.from({ length: 20 }, () =>
+			withStartLock(path, async () => {
+				most = Math.max(most, ++holding);
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				holding--;
+			}),
+		),
+	);
 	expect(most).toBe(1);
-	expect(existsSync(directory)).toBe(false);
+	// Another process takes it and is killed holding it: the lock is free again, with nothing to reclaim.
+	const holder = Bun.spawn(
+		[
+			process.execPath,
+			"-e",
+			`import { withStartLock } from ${JSON.stringify(join(import.meta.dir, "../src/server/lock.ts"))};
+await withStartLock(${JSON.stringify(path)}, async () => { console.log("held"); await new Promise(() => {}); });`,
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const reader = holder.stdout.getReader();
+	expect(new TextDecoder().decode((await reader.read()).value)).toContain("held");
+	expect(lockHeld(path)).toBe(true);
+	holder.kill("SIGKILL");
+	await holder.exited;
+	expect(lockHeld(path)).toBe(false);
+	let taken = false;
+	await withStartLock(path, async () => {
+		taken = true;
+	});
+	expect(taken).toBe(true);
 }, 30_000);
 
 test("a state write still in flight when a daemon stops doesn't replace a replacement's state", async () => {
@@ -731,26 +746,21 @@ test("a state write still in flight when a daemon stops doesn't replace a replac
 	}
 }, 45_000);
 
-test("a reclaimer's guard isn't taken from it while it lives, however old", async () => {
-	const directory = join(mkdtempSync(join(realpathSync("/tmp"), "sr-guard-")), "start.lock");
-	mkdirSync(directory);
-	writeFileSync(join(directory, "pid"), "2147483646");
-	// A live reclaimer's guard, written long ago.
-	const guard = `${directory}.reclaim`;
-	mkdirSync(guard);
-	writeFileSync(join(guard, "pid"), String(process.pid));
-	const old = new Date(Date.now() - 60_000);
-	utimesSync(guard, old, old);
-	let held = false;
-	const taking = withStartLock(directory, async () => {
-		held = true;
-	});
-	await new Promise((resolve) => setTimeout(resolve, 400));
-	expect([held, existsSync(guard)]).toEqual([false, true]);
-	rmSync(guard, { recursive: true, force: true });
-	await taking;
-	expect(held).toBe(true);
-});
+test("a start lock held by a live process times out instead of waiting forever", async () => {
+	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-wait-")), "start.lock");
+	const { promise: holding, resolve: release } = Promise.withResolvers<void>();
+	const held = withStartLock(path, () => holding);
+	const started = Date.now();
+	try {
+		expect(await withStartLock(path, async () => "taken").catch((error: Error) => error.message)).toBe(
+			"server start lock timed out; retry",
+		);
+		expect(Date.now() - started).toBeGreaterThanOrEqual(15_000);
+	} finally {
+		release();
+		await held;
+	}
+}, 30_000);
 
 test("stopping a server that has stopped answering fails, and leaves its files", async () => {
 	await stopAllServers();

@@ -1,11 +1,11 @@
 // Find or start a project daemon and exchange one JSON message per socket connection.
 import { spawn, type ChildProcess } from "node:child_process";
-import { open, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { open, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import type { Project } from "../project.ts";
 import type { RequestType } from "../upstream.ts";
-import { withStartLock } from "./lock.ts";
+import { lockHeld, withStartLock } from "./lock.ts";
 import { serverPaths, stateParent, type ServerPaths } from "./paths.ts";
 import { projectSignature } from "./signature.ts";
 
@@ -181,13 +181,9 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
+// A server that's starting holds its project's lock.
 async function startingLockAlive(paths: ServerPaths): Promise<boolean> {
-	try {
-		const [pid, info] = await Promise.all([readFile(join(paths.lock, "pid"), "utf8"), stat(paths.lock)]);
-		return Date.now() - info.mtimeMs < startTimeout && pidAlive(Number(pid));
-	} catch {
-		return false;
-	}
+	return lockHeld(paths.lock);
 }
 
 // Each graph server holds a whole program in memory (400–900 MB on large repositories), so keep few running.

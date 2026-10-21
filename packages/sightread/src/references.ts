@@ -18,7 +18,7 @@ import {
 } from "typescript/unstable/ast";
 import { fromHandle, toHandle, type GraphNode, type GraphResult } from "./model.ts";
 import type { PathMapper } from "./paths.ts";
-import { APIExitError, untilExit } from "./api.ts";
+import { APIExitError, closeAPI, processOf, untilExit } from "./api.ts";
 import { projectFiles, sourceFileNames, type Project } from "./project.ts";
 import {
 	graphKind,
@@ -168,19 +168,6 @@ async function directoriesUnder(directory: string): Promise<string[]> {
 	return found;
 }
 
-// Every source file under a directory that has just appeared, outside node_modules.
-async function sourcesUnder(directory: string): Promise<string[]> {
-	const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
-	const found: string[] = [];
-	for (const entry of entries) {
-		const path = join(directory, entry.name);
-		if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith("."))
-			found.push(...(await sourcesUnder(path)));
-		else if (entry.isFile() && SOURCE.test(entry.name)) found.push(path);
-	}
-	return found;
-}
-
 /** Keep one TypeScript language service for a daemon's lifetime, brought up to date before each query. */
 export function createReferenceIndex(project: Project): ReferenceIndex {
 	let api = new API({ cwd: project.root });
@@ -202,7 +189,16 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 				if (before.entries.has(entry)) continue;
 				const path = join(directory, entry);
 				if (SOURCE.test(entry)) found.push(path);
-				else found.push(...(await sourcesUnder(path)));
+				// A new directory is watched from now on, empty or not, with those under it; any sources already in
+				// them are new too.
+				else
+					for (const under of await directoriesUnder(path)) {
+						if (listings.has(under)) continue;
+						const listed = await listing(under);
+						if (!listed) continue;
+						listings.set(under, listed);
+						for (const name of listed.entries) if (SOURCE.test(name)) found.push(join(under, name));
+					}
 			}
 		}
 		return found;
@@ -256,19 +252,27 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 
 	// One query at a time. A process that exits under one would leave it waiting forever, so each is raced against
 	// that, and the next query starts a new process from nothing.
+	const restart = () => {
+		api = new API({ cwd: project.root });
+		snapshot = undefined;
+		stamps.clear();
+		missing.clear();
+		listings.clear();
+	};
+	// A process that exited between queries fails the next request at once, as a closed connection rather than an
+	// exit, so it's checked before each query and after any failure.
+	const gone = () => {
+		const child = processOf(api);
+		return !!child && (child.exitCode !== null || child.signalCode !== null);
+	};
 	const serially = <T>(task: () => Promise<T>): Promise<T> => {
-		const result = sequence.then(() =>
-			untilExit(api, task()).catch((error: unknown) => {
-				if (error instanceof APIExitError && !closed) {
-					api = new API({ cwd: project.root });
-					snapshot = undefined;
-					stamps.clear();
-					missing.clear();
-					listings.clear();
-				}
+		const result = sequence.then(() => {
+			if (gone() && !closed) restart();
+			return untilExit(api, task()).catch((error: unknown) => {
+				if ((error instanceof APIExitError || gone()) && !closed) restart();
 				throw error;
-			}),
-		);
+			});
+		});
 		sequence = result.catch(() => undefined);
 		return result;
 	};
@@ -447,7 +451,7 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		// Closed first, so a query waiting on a process that has stopped answering is released.
 		close: async () => {
 			closed = true;
-			await api.close();
+			await closeAPI(api);
 			await sequence;
 		},
 	};

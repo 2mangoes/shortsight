@@ -6,7 +6,7 @@ import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
 import type { Node, SourceFile } from "typescript/unstable/ast";
 import type { FileSystem } from "typescript/unstable/fs";
-import { APIExitError, processOf, untilExit } from "./api.ts";
+import { APIExitError, closeAPI, processOf, untilExit } from "./api.ts";
 import { toHandle } from "./model.ts";
 import { graphKind, indexDeclarations, type DeclarationKind, type Unindexed } from "./naming.ts";
 
@@ -91,7 +91,7 @@ export function createDeclarationParser(): DeclarationParser {
 		const task = sequence.then(async () => {
 			if (closed) throw new Error("Range index is closed");
 			if (exited) {
-				await api.close();
+				await closeAPI(api);
 				api = new API({ cwd: root, fs });
 				configured = false;
 				watched = undefined;
@@ -100,6 +100,8 @@ export function createDeclarationParser(): DeclarationParser {
 			}
 			// The process can exit under a parse in flight too, which the API would leave waiting forever.
 			return untilExit(api, parseWith(api, fileName, text)).catch((error: unknown) => {
+				// A parse that closing cut off.
+				if (closed) throw new Error("Range index is closed");
 				if (!(error instanceof APIExitError)) throw error;
 				exited = true;
 				throw new Error("TypeScript parser process exited");
@@ -146,7 +148,7 @@ export function createDeclarationParser(): DeclarationParser {
 		async close() {
 			closed = true;
 			// Closed first, so a parse waiting on a process that has stopped answering is released.
-			await api.close();
+			await closeAPI(api);
 			await sequence;
 		},
 	};

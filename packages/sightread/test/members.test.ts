@@ -246,6 +246,11 @@ test("details lists a type alias's members and qualifies an object literal's, an
 	expect(member("Lit.lprop").note).toBeUndefined();
 	expect(member("Color.Red").nodes.map(({ handle }) => handle)).toEqual(["src/decl.ts#Color.Red:variable"]);
 	expect(member("Color.Red").note).toBe("Color.Red has no graph node, so no edges; references lists its uses");
+	// Raw output is the graph's own answer, which has no node for it.
+	const raw = JSON.parse(run("--raw", JSON.stringify({ type: "details", handles: ["Color.Red"] })).out) as {
+		result: { nodes: unknown[]; unknown: string[] };
+	};
+	expect([raw.result.nodes, raw.result.unknown]).toEqual([[], ["src/decl.ts#Color.Red:variable"]]);
 });
 
 test("a reverse trace from a member with no node starts from its references; other traces say why they can't", () => {
