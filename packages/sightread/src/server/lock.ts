@@ -5,6 +5,7 @@
 // Node process taking a lock just after a crash, while another takes it too, can be that unseen holder.
 import { closeSync, openSync, rmSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { createConnection, createServer, type Server } from "node:net";
 import { dirname } from "node:path";
 
@@ -14,9 +15,10 @@ const LOCK_NB = 4;
 const bun = typeof process.versions.bun === "string";
 
 let libc: { flock(fd: number, operation: number): number } | undefined;
-async function flock(fd: number, operation: number): Promise<number> {
+// Loaded with require, which Bun answers at once, so a lock is taken in the order it's asked for; Node never loads it.
+function flock(fd: number, operation: number): number {
 	if (!libc) {
-		const { dlopen, FFIType } = await import("bun:ffi");
+		const { dlopen, FFIType } = createRequire(import.meta.url)("bun:ffi") as typeof import("bun:ffi");
 		libc = dlopen(process.platform === "darwin" ? "libc.dylib" : "libc.so.6", {
 			flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 		}).symbols;
@@ -68,7 +70,7 @@ async function tryLock(path: string): Promise<(() => void) | undefined> {
 	if (bun) {
 		// A lock's file stays: removing it while another process waits on it would let a third lock a new file there.
 		const fd = openSync(`${path}.flock`, "a");
-		if ((await flock(fd, LOCK_EX | LOCK_NB)) !== 0) {
+		if (flock(fd, LOCK_EX | LOCK_NB) !== 0) {
 			closeSync(fd);
 			return undefined;
 		}

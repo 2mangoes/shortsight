@@ -733,6 +733,7 @@ test("a start lock held by a live process times out instead of waiting forever",
 	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-wait-")), "start.lock");
 	const { promise: holding, resolve: release } = Promise.withResolvers<void>();
 	const held = withStartLock(path, () => holding);
+	await until(() => lockHeld(path));
 	const started = Date.now();
 	try {
 		expect(await withStartLock(path, async () => "taken").catch((error: Error) => error.message)).toBe(
