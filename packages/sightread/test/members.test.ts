@@ -32,6 +32,12 @@ const shapes = [
 	"export const deepObj = { nest: { deepMethod() { return 1; }, deepField: 2 }, shortValue } satisfies object;",
 	"const wrapped = ({ wrappedField: 1 }) as const;",
 	"export function makesLocal() { const loc = { localMember: wrapped.wrappedField }; return loc.localMember; }",
+	"export const annotated: { annotatedField: number } = { annotatedField: 1 };",
+	"const make = <T,>(value: T) => value;",
+	"export const made = make(class { madeMethod() { return 1; } });",
+	"export function localType() { type LocalShape = { localShapeField: number }; const shaped: LocalShape = { localShapeField: 1 }; return shaped.localShapeField; }",
+	"class Hidden { constructor(private hiddenParam: number) {} }",
+	"export const hiddenInstance = new Hidden(1);",
 ].join("\n");
 
 const uses = [
@@ -47,6 +53,7 @@ const uses = [
 	"function Comp(props: Lit) { return null; }",
 	"export const element = <Comp lprop={1} lmethod={() => {}} nested={{ deep: 1 }} />;",
 	"export const written: Lit = { lprop: 2, lmethod() {}, nested: { deep: 2 } };",
+	"export type OnlyRed = Color.Red;",
 ].join("\n");
 
 const fixture = createFixtureProject({
@@ -104,10 +111,13 @@ test("declarations are named as the graph names them, with what it has no node f
 	);
 	expect(flags).toMatchObject({
 		"Iface.iprop": "property",
-		"Lit.lprop": "property member",
-		"Lit.lmethod": "method member",
-		"Lit.nested.deep": "property member",
-		"Inter.xprop": "property member",
+		// A type literal an alias, a member or a variable's type holds gives its members nodes, nested and through `&`.
+		"Lit.lprop": "property",
+		"Lit.lmethod": "method",
+		"Lit.nested.deep": "property",
+		"Inter.xprop": "property",
+		"annotated.annotatedField": "property",
+		// An enum's members are facts on the enum.
 		"Color.Red": "property member",
 		// A module-level variable's object literal gives its members nodes, nested and through `as` or `satisfies`.
 		"obj.omethod": "method",
@@ -118,17 +128,17 @@ test("declarations are named as the graph names them, with what it has no node f
 		"deepObj.shortValue": "property",
 		"wrapped.wrappedField": "property",
 		"Cls.#priv": "property",
-		"Cls.paramProp": "property member",
+		"Cls.paramProp": "property",
+		"Hidden.hiddenParam": "property",
 		"Cls.method.methodLocal": "variable",
 		"NS.nv": "variable",
 		"NS.nf": "function",
-		// The graph leaves the namespace off a member it doesn't export.
-		"NS.hidden": "function as hidden",
+		"NS.hidden": "function",
 		"default.inDefault": "variable",
 		"arrow.inner": "variable",
 		"arrow.plain": "variable local",
 		"fn.blockLocal": "variable",
-		"ClassExpr.ce": "method member",
+		"ClassExpr.ce": "method",
 		"Aug.augprop": "property",
 	});
 	// An inline type literal, such as a parameter's, names nothing.
@@ -161,7 +171,7 @@ test("every member resolves by name, and references find each use", () => {
 		"Lit.lprop": ["use.tsx:4", "use.tsx:5", "use.tsx:11", "use.tsx:12"],
 		"Lit.nested.deep": ["use.tsx:5", "use.tsx:11", "use.tsx:12"],
 		"Inter.xprop": ["use.tsx:5"],
-		"Color.Red": ["use.tsx:5"],
+		"Color.Red": ["use.tsx:5", "use.tsx:13"],
 		"obj.ofield": ["use.tsx:5"],
 		"obj.omethod": ["use.tsx:5"],
 		"Cls.#priv": ["decl.ts:11", "decl.ts:12"],
@@ -199,7 +209,7 @@ test("a reference names the innermost declaration the graph has a node for", () 
 	expect(containers("Lit.lprop").at(-1)).toBe("src/use.tsx#written.lprop:variable");
 });
 
-test("details lists a type alias's members and qualifies an object literal's", () => {
+test("details lists a type alias's members and qualifies an object literal's, and says which have no node", () => {
 	const result = query<{ nodes: Array<{ handle: string; ranges: unknown }>; sections: { members: string[] } }>({
 		type: "details",
 		handles: ["Lit", "obj", "Color"],
@@ -216,58 +226,95 @@ test("details lists a type alias's members and qualifies an object literal's", (
 	);
 	for (const node of result.nodes)
 		expect(node.ranges).toEqual([{ start: expect.any(Number), end: expect.any(Number) }]);
-	const member = query<{ nodes: Array<{ handle: string }>; note?: string }>({
+	// memberLimit says when it leaves a type alias's members out.
+	const limited = query<{ sections: { members: string[] }; raise?: string }>({
 		type: "details",
-		handles: ["Lit.lprop"],
+		handles: ["Lit"],
+		memberLimit: 1,
 	});
-	expect(member.nodes.map(({ handle }) => handle)).toEqual(["src/decl.ts#Lit.lprop:variable"]);
-	expect(member.note).toBe("Lit.lprop has no graph node, so no edges; references lists its uses");
+	expect([limited.sections.members.length, limited.raise]).toEqual([1, "details.memberLimit"]);
+	// So does the graph's own member list, an enum's here.
+	const enumLimited = query<{ sections: { members: string[] }; raise?: string }>({
+		type: "details",
+		handles: ["Color"],
+		memberLimit: 1,
+	});
+	expect([enumLimited.sections.members.length, enumLimited.raise]).toEqual([1, "details.memberLimit"]);
+	const member = (handle: string) =>
+		query<{ nodes: Array<{ handle: string }>; note?: string }>({ type: "details", handles: [handle] });
+	expect(member("Lit.lprop").nodes.map(({ handle }) => handle)).toEqual(["src/decl.ts#Lit.lprop:variable"]);
+	expect(member("Lit.lprop").note).toBeUndefined();
+	expect(member("Color.Red").nodes.map(({ handle }) => handle)).toEqual(["src/decl.ts#Color.Red:variable"]);
+	expect(member("Color.Red").note).toBe("Color.Red has no graph node, so no edges; references lists its uses");
+	// Raw output is the graph's own answer, which has no node for it.
+	const raw = JSON.parse(run("--raw", JSON.stringify({ type: "details", handles: ["Color.Red"] })).out) as {
+		result: { nodes: unknown[]; unknown: string[] };
+	};
+	expect([raw.result.nodes, raw.result.unknown]).toEqual([[], ["src/decl.ts#Color.Red:variable"]]);
 });
 
-test("a reverse trace from a member starts from its references; other traces say why they can't", () => {
-	const result = query<{ nodes: Array<{ name: string }>; note?: string }>({
+test("a reverse trace from a member with no node starts from its references; other traces say why they can't", () => {
+	const trace = (from: string) =>
+		query<{ nodes: Array<{ name: string }>; note?: string }>({ type: "trace", from, direction: "reverse" });
+	// A type literal's member is a node, so its users come from the graph.
+	expect(trace("Lit.lprop").nodes.map(({ name }) => name)).toEqual(["Lit.lprop", "readsAll", "element"]);
+	expect(trace("Lit.lprop").note).toBeUndefined();
+	expect(run(JSON.stringify({ type: "trace", from: "Lit.lprop" })).code).toBe(0);
+	expect(trace("Color.Red").nodes.map(({ name }) => name)).toEqual(["Color.Red", "readsAll", "OnlyRed"]);
+	// A use in a type is a type reference, as the graph calls one; a read is an access.
+	const kinds = query<{ edges: Array<{ from: string; kind: string }> }>({
 		type: "trace",
-		from: "Lit.lprop",
+		from: "Color.Red",
 		direction: "reverse",
-	});
-	expect(result.nodes.map(({ name }) => name)).toEqual(["Lit.lprop", "readsAll", "element", "written.lprop"]);
-	expect(result.note).toBe("Lit.lprop has no graph node, so its direct users come from its references");
-	expect(run(JSON.stringify({ type: "trace", from: "Lit.lprop" })).err).toBe(
-		"sightread: trace can only go reverse from Lit.lprop: the graph has no node for it, as it's a member of Lit; trace reverse from it for what uses it, or ask references",
+	}).edges.map(({ from, kind }) => [from, kind]);
+	expect(kinds).toEqual([
+		["src/use.tsx#readsAll:function", "accesses"],
+		["src/use.tsx#OnlyRed:type", "type_ref"],
+	]);
+	expect(
+		query<{ nodes: Array<{ line: number; inType?: true }> }>({ type: "references", symbol: "Color.Red" }).nodes.map(
+			({ line, inType }) => [line, inType ?? false],
+		),
+	).toEqual([
+		[5, false],
+		[13, true],
+	]);
+	expect(trace("Color.Red").note).toBe("Color.Red has no graph node, so its direct users come from its references");
+	expect(run(JSON.stringify({ type: "trace", from: "Color.Red" })).err).toBe(
+		"sightread: trace can only go reverse from Color.Red: the graph has no node for it, as it's a member of Color; trace reverse from it for what uses it, or ask references",
 	);
 	expect(run(JSON.stringify({ type: "trace", from: "readsAll", to: "Color.Red" })).err).toStartWith(
 		"sightread: trace can't reach Color.Red:",
 	);
 });
 
-test("a namespace member resolves by its full name, though the graph leaves the namespace off", () => {
+test("a member a namespace doesn't export resolves by its full name, as the graph names it", () => {
 	expect(
 		query<{ nodes: Array<{ in?: { handle: string } }> }>({ type: "references", symbol: "NS.hidden" }).nodes,
 	).toEqual([]);
 	const details = query<{ nodes: Array<{ handle: string }> }>({ type: "details", handles: ["NS.hidden"] });
-	expect(details.nodes.map(({ handle }) => handle)).toContain("src/decl.ts#hidden:function");
+	expect(details.nodes.map(({ handle }) => handle)).toEqual(["src/decl.ts#NS.hidden:function"]);
 });
 
-test("declarations the graph merges under one name are told apart by their full names", async () => {
+test("namespace members of one name are told apart, each with its own users", async () => {
 	const declarations = await parseDeclarations("merged.ts", `${fixtureFile("src/merged.ts")}`);
-	expect(declarations.filter(({ unindexed }) => unindexed === "shared").map(({ name }) => name)).toEqual([
-		"A.hidden",
-		"B.hidden",
+	expect(
+		declarations.filter(({ name }) => name.endsWith(".hidden")).map(({ name, unindexed }) => [name, unindexed]),
+	).toEqual([
+		["A.hidden", undefined],
+		["B.hidden", undefined],
 	]);
 	const lines = (symbol: string) =>
 		query<{ nodes: Array<{ line: number }> }>({ type: "references", symbol }).nodes.map(({ line }) => line);
 	expect(lines("A.hidden")).toEqual([1]);
 	expect(lines("B.hidden")).toEqual([2, 2]);
-	expect(run(JSON.stringify({ type: "references", symbol: "src/merged.ts#hidden:function" })).err).toBe(
-		"sightread: src/merged.ts#hidden:function is 2 declarations the graph merges; use one: src/merged.ts#A.hidden:function, src/merged.ts#B.hidden:function",
-	);
 	const trace = query<{ nodes: Array<{ name: string }>; edges: Array<{ kind: string }> }>({
 		type: "trace",
 		from: "B.hidden",
 		direction: "reverse",
 	});
 	expect(trace.nodes.map(({ name }) => name)).toEqual(["B.b", "B.hidden"]);
-	expect(trace.edges.map(({ kind }) => kind)).toEqual(["calls", "calls"]);
+	expect(trace.edges.map(({ kind }) => kind)).toEqual(["calls"]);
 });
 
 test("a default export and its members are named as the graph names them", async () => {

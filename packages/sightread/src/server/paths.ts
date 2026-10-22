@@ -2,16 +2,18 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Project } from "../project.ts";
 
 export interface ServerPaths {
 	parent: string;
 	directory: string;
 	socket: string;
-	state: string;
 	log: string;
+	/** Held by the project's daemon for as long as it runs. Like every lock, a socket, so no longer than `socket`. */
 	lock: string;
+	/** Held by a client while it starts or stops the daemon. */
+	start: string;
 }
 
 export function stateParent(): string {
@@ -56,14 +58,17 @@ export function serverPaths(project: Project): ServerPaths {
 		.update(resolve(project.tsconfig))
 		.digest("hex")
 		.slice(0, 20);
-	const directory = join(parent, hash);
-	const socket = join(directory, "server.sock");
+	return serverPathsIn(join(parent, hash));
+}
+
+/** The files of the server whose directory, under the state parent, is `directory`. */
+export function serverPathsIn(directory: string): ServerPaths {
 	return {
-		parent,
+		parent: dirname(directory),
 		directory,
-		socket,
-		state: join(directory, "state.json"),
+		socket: join(directory, "server.sock"),
 		log: join(directory, "server.log"),
-		lock: join(directory, "start.lock"),
+		lock: join(directory, "daemon.lock"),
+		start: join(directory, "client.lock"),
 	};
 }

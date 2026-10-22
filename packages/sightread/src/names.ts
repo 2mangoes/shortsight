@@ -180,7 +180,7 @@ export async function resolveNamesSettled(
 				}
 			}
 			// A name the graph doesn't use is found in the file of what it's declared in: a member the graph keeps no node
-			// for, such as a type literal's (`Props.onChange`), or a namespace member it names without its namespace.
+			// for, such as an enum's (`Color.Red`).
 			if (!exact.length && namespace === undefined && declarations && name.includes(".")) {
 				const owner = name.slice(0, name.indexOf("."));
 				const files =
@@ -248,11 +248,15 @@ export async function resolveNamesSettled(
 			const entries = Array.isArray(value) ? value : [value];
 			const error = entries.map((item) => resolved.get(item)).find((item) => item instanceof Error);
 			if (error instanceof Error) return { error: error.message };
-			if (typeof value === "string") copy[field] = resolved.get(value) ?? value;
+			// A resolved name is already the graph's own handle; only what was given is converted to the project's terms.
+			const project = (item: string) =>
+				(resolved.get(item) as string | undefined) ?? paths?.inputToProjectHandle(item) ?? item;
+			if (typeof value === "string") copy[field] = project(value);
 			else if (Array.isArray(value))
-				copy[field] = value.map((item) => (typeof item === "string" ? (resolved.get(item) ?? item) : item));
+				copy[field] = value.map((item) => (typeof item === "string" ? project(item) : item));
 		}
-		return settle(copy, index);
+		const alias = aliased[index];
+		return alias instanceof Error ? { error: alias.message } : { request: copy };
 	});
 }
 

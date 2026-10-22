@@ -26,6 +26,8 @@ export interface GraphNode {
 	text?: string;
 	/** The declaration a reference sits in, as the graph names it. */
 	in?: { handle: string; name: string; kind: string; start: number; end: number; exported?: true };
+	/** A reference that's a use in a type, such as `type Only = Color.Red`. */
+	inType?: true;
 	/** The call a reference is the callee of, and each of its arguments: ranges are 1-based, UTF-16, exclusive end. */
 	call?: {
 		line: number;
@@ -114,7 +116,8 @@ function utf16Column(line: string, byteColumn: number): number | undefined {
 	return bytes === byteColumn - 1 ? units + 1 : undefined;
 }
 
-async function evidenceLines(value: unknown, root: string): Promise<Map<string, string[]>> {
+// Evidence names files relative to the project; any in the repository can be read, a sibling package's included.
+async function evidenceLines(value: unknown, root: string, boundary = root): Promise<Map<string, string[]>> {
 	const files = new Set<string>();
 	const collect = (nested: unknown): void => {
 		if (Array.isArray(nested)) return nested.forEach(collect);
@@ -136,7 +139,7 @@ async function evidenceLines(value: unknown, root: string): Promise<Map<string, 
 	const contents = await Promise.all(
 		[...files].map(async (file): Promise<[string, string[]] | undefined> => {
 			const absolute = resolve(root, file);
-			const path = relative(root, absolute);
+			const path = relative(boundary, absolute);
 			if (!path || path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path)) return undefined;
 			try {
 				return [file, (await readFile(absolute, "utf8")).split(/\r\n|\n|\r/)];
@@ -187,17 +190,49 @@ function truncated(value: unknown): boolean {
 	return item ? item.truncated === true || Object.values(item).some(truncated) : false;
 }
 
-// The graph marks a trace truncated whether its symbol or hop budget, its depth, or a dispatch fanout it withheld
-// ended the walk, so name the bound that did: a full budget, else the depth if the walk reached it.
-function traceLimit(request: Record<string, unknown>, root: Record<string, unknown>): string {
-	// A path search follows maxDepth alone.
-	if (request.to !== undefined) return "maxDepth";
-	const budget = typeof request.maxNodes === "number" ? Math.max(1, Math.floor(request.maxNodes)) : 12;
-	const reached = Array.isArray(root.reached) ? root.reached : [];
-	const hops = Array.isArray(root.hops) ? root.hops : [];
-	if (reached.length >= budget || hops.length >= budget * 2) return "maxNodes";
-	const depth = typeof request.maxDepth === "number" ? Math.max(1, Math.floor(request.maxDepth)) : 3;
+// The graph says it cut a class's, an interface's or an enum's members to memberLimit only in its audit text.
+const membersCut = (value: unknown) => {
+	const audit = object(value)?.audit;
+	return typeof audit === "string" && audit.includes("member list was cut");
+};
+
+/** The graph stops an open walk at this many hops per symbol it may return, as well as at the symbols themselves. */
+export const HOPS_PER_NODE = 2;
+
+/** A trace's maxNodes or maxDepth as the graph reads it: a whole number of at least one, or its default. */
+export function traceBound(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : fallback;
+}
+
+const listed = (value: unknown) => (Array.isArray(value) ? value : []);
+
+/**
+ * What cut a trace the graph marks truncated, which it does whether its symbol or hop budget filled, the walk
+ * reached its depth, or it withheld a dispatch fanout of 12 or more implementations: a full budget, else the depth
+ * if the walk reached it, else that fanout, which only `complete` follows.
+ */
+export function traceCut(
+	trace: Record<string, unknown>,
+	budget: number,
+	depth: number,
+): "maxNodes" | "maxDepth" | "complete" | undefined {
+	if (trace.truncated !== true) return undefined;
+	const reached = listed(trace.reached);
+	if (reached.length >= budget || listed(trace.hops).length >= budget * HOPS_PER_NODE) return "maxNodes";
 	return reached.some((item) => Number(object(item)?.depth) >= depth) ? "maxDepth" : "complete";
+}
+
+// The bound to raise for more of a truncated trace. A path search follows maxDepth alone, unless the graph says a
+// dispatch fanout it withheld stopped it, which only `complete` follows.
+function traceLimit(request: Record<string, unknown>, root: Record<string, unknown>, next: unknown): string {
+	if (request.to !== undefined) {
+		const reason = object(next)?.reason;
+		return typeof reason === "string" && !reason.includes("maxDepth") ? "complete" : "maxDepth";
+	}
+	return (
+		traceCut({ ...root, truncated: true }, traceBound(request.maxNodes, 12), traceBound(request.maxDepth, 3)) ??
+		"maxNodes"
+	);
 }
 
 function symbol(
@@ -237,7 +272,7 @@ export async function normalizeResult(
 	paths?: PathMapper,
 ): Promise<GraphResult> {
 	const root = object(object(upstreamValue)?.result) ?? object(upstreamValue) ?? {};
-	const linesByFile = await evidenceLines(root, paths?.project ?? process.cwd());
+	const linesByFile = await evidenceLines(root, paths?.project ?? process.cwd(), paths?.repository);
 	const type = typeof root.type === "string" ? root.type : String(request.type ?? "result");
 	const nodes = new Map<string, GraphNode>();
 	const edges: GraphEdge[] = [];
@@ -396,16 +431,21 @@ export async function normalizeResult(
 			);
 		if (converted !== undefined) sections[key] = converted;
 	}
-	// The graph lists no members for a type alias, so name its type literal's own, as an interface's are.
+	// The graph lists no members for a type alias, so name its type literal's own, as an interface's are, and say when
+	// memberLimit leaves some out.
+	let membersCapped = false;
 	for (const alias of aliases) {
 		const own = ((await ranges.declarations(alias.file)) ?? []).filter(
 			(declaration) =>
-				declaration.unindexed === "member" &&
+				!declaration.local &&
+				(declaration.kind === "property" || declaration.kind === "method") &&
 				declaration.name.startsWith(`${alias.name}.`) &&
 				!declaration.name.slice(alias.name.length + 1).includes("."),
 		);
-		const limit = typeof request.memberLimit === "number" ? request.memberLimit : Infinity;
-		for (const declaration of [...new Map(own.map((item) => [item.name, item])).values()].slice(0, limit))
+		const limit = traceBound(request.memberLimit, Infinity);
+		const unique = [...new Map(own.map((item) => [item.name, item])).values()];
+		if (unique.length > limit) membersCapped = true;
+		for (const declaration of unique.slice(0, limit))
 			members.push({ file: alias.file, name: declaration.name, kind: declaration.kind });
 	}
 	// A member can also be a neighbour, under another kind (a property the graph calls a variable), so add members
@@ -482,12 +522,17 @@ export async function normalizeResult(
 	const first = primaryLists.find((key) => Array.isArray(root[key]));
 	const shown = first ? (root[first] as unknown[]).length : 0;
 	const total = typeof root.total === "number" ? root.total : undefined;
-	const limit = type === "trace" ? traceLimit(request, root) : type === "details" ? "memberLimit" : "limit";
+	const limit =
+		type === "trace"
+			? traceLimit(request, root, object(upstreamValue)?.next)
+			: type === "details"
+				? "memberLimit"
+				: "limit";
 	const model: GraphResult = {
 		type,
 		shown,
 		...(total === undefined ? {} : { total }),
-		...(truncated(root) ? { raise: `${type}.${limit}` } : {}),
+		...(truncated(root) || membersCapped || membersCut(upstreamValue) ? { raise: `${type}.${limit}` } : {}),
 		nodes: sorted,
 		edges,
 		sections,

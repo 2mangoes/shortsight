@@ -9,14 +9,17 @@ import {
 	isConstructorDeclaration,
 	isNewExpression,
 	isPropertyAccessExpression,
+	isQualifiedName,
 	isSourceFile,
+	isTypeNode,
 	SyntaxKind,
 	type Node,
 	type SourceFile,
 } from "typescript/unstable/ast";
 import { fromHandle, toHandle, type GraphNode, type GraphResult } from "./model.ts";
 import type { PathMapper } from "./paths.ts";
-import { projectFiles, type Project } from "./project.ts";
+import { APIExitError, closeAPI, processOf, untilExit } from "./api.ts";
+import { projectFiles, sourceFileNames, type Project } from "./project.ts";
 import {
 	graphKind,
 	indexDeclarations,
@@ -54,6 +57,7 @@ interface Found {
 	text: string;
 	container?: Container;
 	call?: { line: number; col: number; endLine: number; endCol: number; arguments: Range[] };
+	inType?: true;
 }
 
 interface Range {
@@ -82,10 +86,6 @@ function findDeclaration(index: DeclarationIndex, name: string, kind: string): N
 	);
 }
 
-// The declarations the graph merges under one name, which a reference search has to be told apart.
-const merged = (index: DeclarationIndex, name: string) =>
-	index.declarations.filter((declaration) => declaration.unindexed === "shared" && declaration.graphName === name);
-
 // The call or `new` a reference is the callee of, so a call split over lines can be shown whole.
 function enclosingCall(reference: Node): Node | undefined {
 	let callee = reference;
@@ -93,6 +93,14 @@ function enclosingCall(reference: Node): Node | undefined {
 		callee = callee.parent;
 	const call = callee.parent;
 	return call && (isCallExpression(call) || isNewExpression(call)) && call.expression === callee ? call : undefined;
+}
+
+// A use in a type, as `Color.Red` in `type Only = Color.Red` or `"onChange"` in `Props["onChange"]`, which the graph
+// calls a type reference. An expression a type holds, such as a computed key, is a value's use.
+function inType(reference: Node): boolean {
+	let node = reference;
+	while (node.parent && isQualifiedName(node.parent)) node = node.parent;
+	return !!node.parent && isTypeNode(node.parent);
 }
 
 // The innermost declaration the graph has a node for that a reference sits in: a member, a function or a
@@ -122,25 +130,35 @@ function containerOf(
 	return undefined;
 }
 
+// Each file's mtime and size, which change when it does.
+async function stampsOf(files: Iterable<string>): Promise<Map<string, string>> {
+	const found = new Map<string, string>();
+	await Promise.all(
+		[...files].map(async (file) => {
+			const metadata = await stat(file).catch(() => undefined);
+			if (metadata) found.set(file, `${metadata.mtimeMs}:${metadata.size}`);
+		}),
+	);
+	return found;
+}
+
 /** Keep one TypeScript language service for a daemon's lifetime, brought up to date before each query. */
 export function createReferenceIndex(project: Project): ReferenceIndex {
-	const api = new API({ cwd: project.root });
+	let api = new API({ cwd: project.root });
 	const stamps = new Map<string, string>();
+	// Every file the program has loaded, so one only imported is seen when it changes, goes or comes back. A file
+	// outside the config's roots that an import couldn't resolve until it was created isn't: a restart finds it.
+	const known = new Set<string>();
 	let snapshot: Snapshot | undefined;
 	let sequence: Promise<unknown> = Promise.resolve();
 	let closed = false;
 
-	// Compare every project file's size and mtime with the last query's, and send TypeScript only what changed.
+	// Compare the size and mtime of the config's roots and every file the program has loaded with the last query's,
+	// and send TypeScript only what changed.
 	const refresh = async (): Promise<Snapshot> => {
 		if (closed) throw new Error("Reference index is closed");
-		const files = await projectFiles(project, api);
-		const current = new Map<string, string>();
-		await Promise.all(
-			[...files].map(async (file) => {
-				const metadata = await stat(file).catch(() => undefined);
-				if (metadata) current.set(file, `${metadata.mtimeMs}:${metadata.size}`);
-			}),
-		);
+		const roots = await projectFiles(project, api);
+		const current = await stampsOf(new Set([...roots, ...known]));
 		const created = [...current.keys()].filter((file) => !stamps.has(file));
 		const changed = [...current.keys()].filter((file) => stamps.has(file) && stamps.get(file) !== current.get(file));
 		const deleted = [...stamps.keys()].filter((file) => !current.has(file));
@@ -148,14 +166,20 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		if (previous && !created.length && !changed.length && !deleted.length) return previous;
 		snapshot = previous
 			? await api.updateSnapshot({
-					openFiles: created,
+					// A root is opened; a file only imported, back again, is resolved through what imports it.
+					openFiles: created.filter((file) => roots.has(file)),
 					closeFiles: deleted,
 					fileChanges: { changed, created, deleted },
 				})
 			: await api.updateSnapshot({ openProjects: [project.tsconfig], openFiles: created });
-		// Record the files only once TypeScript has them, so a failed update is retried next time.
+		// Record the files only once TypeScript has them, so a failed update is retried next time: those compared now,
+		// and any the program has just started loading.
+		const loaded = await sourceFileNames(snapshot);
+		for (const file of loaded) known.add(file);
+		const added = await stampsOf([...loaded].filter((file) => !current.has(file)));
 		stamps.clear();
-		for (const [file, stamp] of current) stamps.set(file, stamp);
+		for (const [file, stamp] of [...current, ...added])
+			if (roots.has(file) || loaded.has(file)) stamps.set(file, stamp);
 		if (previous) {
 			api.clearSourceFileCache();
 			await previous.dispose();
@@ -163,8 +187,28 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 		return snapshot;
 	};
 
+	// One query at a time. A process that exits under one would leave it waiting forever, so each is raced against
+	// that, and the next query starts a new process from nothing.
+	const restart = () => {
+		api = new API({ cwd: project.root });
+		snapshot = undefined;
+		stamps.clear();
+		known.clear();
+	};
+	// A process that exited between queries fails the next request at once, as a closed connection rather than an
+	// exit, so it's checked before each query and after any failure.
+	const gone = () => {
+		const child = processOf(api);
+		return !!child && (child.exitCode !== null || child.signalCode !== null);
+	};
 	const serially = <T>(task: () => Promise<T>): Promise<T> => {
-		const result = sequence.then(task);
+		const result = sequence.then(() => {
+			if (gone() && !closed) restart();
+			return untilExit(api, task()).catch((error: unknown) => {
+				if ((error instanceof APIExitError || gone()) && !closed) restart();
+				throw error;
+			});
+		});
 		sequence = result.catch(() => undefined);
 		return result;
 	};
@@ -199,11 +243,6 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 			return index;
 		};
 		const declaration = source && findDeclaration(indexOf(source), ref.name, ref.kind);
-		const shared = source && !declaration ? merged(indexOf(source), ref.name) : [];
-		if (shared.length)
-			throw new Error(
-				`${handle} is ${shared.length} declarations the graph merges; use one: ${shared.map((item) => toHandle(paths.toRepositoryPath(local.split(sep).join("/")), item.name, graphKind(item.kind))).join(", ")}`,
-			);
 		if (!home || !source || !declaration) throw new Error(`${handle} not found`);
 		// Its overloads and merged declarations share its full name.
 		const own = indexOf(source).of(declaration)!.name;
@@ -260,6 +299,7 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 					.slice(line, last + 1)
 					.join("\n"),
 				...(container ? { container } : {}),
+				...(inType(reference) ? { inType: true as const } : {}),
 				...(call
 					? {
 							call: {
@@ -344,11 +384,11 @@ export function createReferenceIndex(project: Project): ReferenceIndex {
 				}
 				return undefined;
 			}),
-		close: () =>
-			serially(async () => {
-				closed = true;
-				await snapshot?.dispose();
-				await api.close();
-			}),
+		// Closed first, so a query waiting on a process that has stopped answering is released.
+		close: async () => {
+			closed = true;
+			await closeAPI(api);
+			await sequence;
+		},
 	};
 }

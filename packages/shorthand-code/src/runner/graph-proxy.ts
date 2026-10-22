@@ -34,7 +34,15 @@ function library(value: unknown): GraphLibrary | undefined {
 interface SightreadManifest {
 	name?: string;
 	version?: string;
-	exports?: { "."?: string };
+	exports?: { "."?: string | { bun?: string; default?: string } };
+}
+
+// The module a sightread manifest exports for this runtime: its source under Bun, its build otherwise, or the one
+// entry an earlier version names.
+function entryOf(manifest: SightreadManifest): string | undefined {
+	const entry = manifest.exports?.["."];
+	if (typeof entry === "string") return entry;
+	return (typeof process.versions.bun === "string" ? entry?.bun : undefined) ?? entry?.default;
 }
 
 async function packageFromPath(path: string): Promise<{ directory: string; manifest: SightreadManifest } | undefined> {
@@ -75,7 +83,7 @@ async function expectedVersion(): Promise<string> {
 
 /**
  * Whether a sightread matching this version is installed, found through module resolution or a `sightread` on
- * PATH. It reads package.json and never imports sightread, because Pi calls it under Node and sightread needs Bun.
+ * PATH. It reads package.json and never imports sightread, so checking doesn't load sightread and the compiler it brings.
  */
 export async function sightreadAvailable(executable = findExecutable("sightread")): Promise<boolean> {
 	const expected = await expectedVersion();
@@ -124,10 +132,10 @@ export function resolveSightread(options: ResolveOptions = {}) {
 			const found = await packageFromPath(executable).catch(() => undefined);
 			if (found) {
 				if (found.manifest.version !== expected) mismatch ??= found.manifest.version ?? "unknown";
-				else if (typeof found.manifest.exports?.["."] === "string") {
+				else if (entryOf(found.manifest)) {
 					try {
 						const fromPath = library(
-							await importer(pathToFileURL(resolve(found.directory, found.manifest.exports["."])).href),
+							await importer(pathToFileURL(resolve(found.directory, entryOf(found.manifest)!)).href),
 						);
 						if (fromPath) return fromPath;
 					} catch {

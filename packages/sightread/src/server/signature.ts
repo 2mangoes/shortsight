@@ -4,6 +4,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Project } from "../project.ts";
+import { parseJSONC } from "../runtime.ts";
 
 const require = createRequire(import.meta.url);
 const names = [
@@ -21,7 +22,8 @@ const versions = ["@ttsc/graph", "ttsc", "typescript"].map((name) => [
 	(require(`${name}/package.json`) as { version: string }).version,
 ]);
 const ownVersion = (require("../../package.json") as { version: string }).version;
-const sourceRoot = join(import.meta.dir, "..");
+// The package's TypeScript source, which it ships whether it runs from it or from its build, so Node and Bun agree.
+const sourceRoot = join(import.meta.dirname, "../../src");
 
 async function sourceFiles(directory: string, prefix = ""): Promise<Array<[string, number, number]>> {
 	const entries = await readdir(directory, { withFileTypes: true });
@@ -74,7 +76,7 @@ async function configChain(selected: string): Promise<Array<[string, number, num
 		seen.add(file);
 		const info = await stat(file);
 		files.push([file, info.mtimeMs, info.size]);
-		const value: unknown = Bun.JSONC.parse(await readFile(file, "utf8"));
+		const value: unknown = parseJSONC(await readFile(file, "utf8"));
 		if (!value || typeof value !== "object" || !("extends" in value)) return;
 		const extension = (value as { extends?: unknown }).extends;
 		const parents =

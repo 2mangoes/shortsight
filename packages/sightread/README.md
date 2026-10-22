@@ -8,7 +8,7 @@
 
 This fork is public on npm; no login is required. If you previously used GitHub Packages, update the [registry setup](https://github.com/2mangoes/shortsight#npm-registry-setup) first.
 
-Install [Bun](https://bun.sh) 1.4 or later, then `sightread`:
+It runs on [Node](https://nodejs.org) 22 or later, or [Bun](https://bun.sh) 1.4 or later:
 
 ```sh
 npm i -g @2mangoes/sightread

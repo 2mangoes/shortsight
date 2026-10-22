@@ -6,6 +6,7 @@ import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
 import type { Node, SourceFile } from "typescript/unstable/ast";
 import type { FileSystem } from "typescript/unstable/fs";
+import { APIExitError, closeAPI, processOf, untilExit } from "./api.ts";
 import { toHandle } from "./model.ts";
 import { graphKind, indexDeclarations, type DeclarationKind, type Unindexed } from "./naming.ts";
 
@@ -20,7 +21,7 @@ export interface Declaration {
 	exported?: true;
 	/** Declared inside a function. */
 	local?: true;
-	/** The graph's name for it where that differs, as `helper` for a namespace member it doesn't export. */
+	/** The graph's name for it where that differs: `default` for a default-exported function or class. */
 	graphName?: string;
 	/** Why the graph has no node of its own for it, when it has none. */
 	unindexed?: Unindexed;
@@ -90,53 +91,65 @@ export function createDeclarationParser(): DeclarationParser {
 		const task = sequence.then(async () => {
 			if (closed) throw new Error("Range index is closed");
 			if (exited) {
-				await api.close();
+				await closeAPI(api);
 				api = new API({ cwd: root, fs });
 				configured = false;
 				watched = undefined;
 				exited = false;
 				throw new Error("TypeScript parser process exited");
 			}
-			// Each parse gets a new virtual file. TypeScript can keep serving an open file's first contents
-			// after a change, so reusing one file per extension returned earlier files' declarations.
-			const file = `${root}/source${++parsed}${extname(fileName) || ".ts"}`;
-			const replaced = previous;
-			if (replaced) files.delete(replaced);
-			files.set(file, text);
-			const snapshot = await api.updateSnapshot({
-				...(configured ? {} : { openProjects: [config] }),
-				openFiles: [file],
-				...(replaced ? { closeFiles: [replaced] } : {}),
-				fileChanges: { created: [file], ...(replaced ? { deleted: [replaced] } : {}) },
+			// The process can exit under a parse in flight too, which the API would leave waiting forever.
+			return untilExit(api, parseWith(api, fileName, text)).catch((error: unknown) => {
+				// A parse that closing cut off.
+				if (closed) throw new Error("Range index is closed");
+				if (!(error instanceof APIExitError)) throw error;
+				exited = true;
+				throw new Error("TypeScript parser process exited");
 			});
-			previous = file;
-			const child = (api as unknown as { client: { process?: ChildProcess } }).client.process;
-			if (child && child !== watched) {
-				watched = child;
-				child.once("exit", () => {
-					exited = true;
-				});
-			}
-			api.clearSourceFileCache();
-			configured = true;
-			try {
-				const project = await snapshot.getDefaultProjectForFile(file);
-				const sourceFile = await project?.program.getSourceFile(file);
-				return sourceFile ? collectDeclarations(sourceFile) : [];
-			} finally {
-				await snapshot.dispose();
-			}
 		});
 		sequence = task.catch(() => undefined);
 		return task;
+	};
+
+	const parseWith = async (current: API, fileName: string, text: string): Promise<Declaration[]> => {
+		// Each parse gets a new virtual file. TypeScript can keep serving an open file's first contents
+		// after a change, so reusing one file per extension returned earlier files' declarations.
+		const file = `${root}/source${++parsed}${extname(fileName) || ".ts"}`;
+		const replaced = previous;
+		if (replaced) files.delete(replaced);
+		files.set(file, text);
+		const snapshot = await current.updateSnapshot({
+			...(configured ? {} : { openProjects: [config] }),
+			openFiles: [file],
+			...(replaced ? { closeFiles: [replaced] } : {}),
+			fileChanges: { created: [file], ...(replaced ? { deleted: [replaced] } : {}) },
+		});
+		previous = file;
+		const child = processOf(current);
+		if (child && child !== watched) {
+			watched = child;
+			child.once("exit", () => {
+				exited = true;
+			});
+		}
+		current.clearSourceFileCache();
+		configured = true;
+		try {
+			const project = await snapshot.getDefaultProjectForFile(file);
+			const sourceFile = await project?.program.getSourceFile(file);
+			return sourceFile ? collectDeclarations(sourceFile) : [];
+		} finally {
+			await snapshot.dispose();
+		}
 	};
 
 	return {
 		parse,
 		async close() {
 			closed = true;
+			// Closed first, so a parse waiting on a process that has stopped answering is released.
+			await closeAPI(api);
 			await sequence;
-			await api.close();
 		},
 	};
 }
@@ -211,6 +224,8 @@ export function createRangeIndex(root: string, options: { maxFiles?: number; wit
 			const cached = cache.get(absolute);
 			if (cached?.mtimeMs === metadata.mtimeMs && cached.size === metadata.size) return cached.declarations;
 			const text = await readFile(absolute, "utf8");
+			// Once closing, no new parser starts.
+			if (closed) return undefined;
 			parser ??= createDeclarationParser();
 			const parsed = await parser.parse(file, text);
 			cache.delete(absolute);
@@ -258,8 +273,10 @@ export function createRangeIndex(root: string, options: { maxFiles?: number; wit
 		},
 		async close() {
 			closed = true;
-			await Promise.all(inFlight.values());
+			// The parser closes first, so a read waiting on a process that has stopped answering is released, not waited
+			// for until its request times out.
 			await parser?.close();
+			await Promise.allSettled(inFlight.values());
 			cache.clear();
 		},
 	};

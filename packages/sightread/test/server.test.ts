@@ -12,10 +12,11 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { createConnection } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { connect, listServers, stopAllServers, stopServer } from "../src/server/client.ts";
+import { connect, exchange, listServers, stopAllServers, stopServer } from "../src/server/client.ts";
+import { lockHeld, withStartLock } from "../src/server/lock.ts";
 import { serverPaths, stateParent } from "../src/server/paths.ts";
 import { projectSignature } from "../src/server/signature.ts";
 
@@ -34,6 +35,11 @@ const environment = [
 ] as const;
 const originals = new Map(environment.map((name) => [name, process.env[name]]));
 const runtime = mkdtempSync(join(realpathSync("/tmp"), "sr-"));
+// Node, to run sightread from source as Node users do: its own executable, not a version manager's shim in front of it,
+// so killing it kills Node.
+const node = Bun.spawnSync([Bun.which("node")!, "-p", "process.execPath"])
+	.stdout.toString()
+	.trim();
 process.env.XDG_RUNTIME_DIR = runtime;
 const component = [
 	"type Row<T> = { id: string; value: T };",
@@ -67,9 +73,14 @@ const second = fixture({
 const project = (root: string) => ({ root, tsconfig: join(root, "tsconfig.json") });
 const lookup = (query: string) => [{ type: "lookup", query }];
 
+// What a CLI request that has to start the project's server prints to stderr, and nothing else.
+const announced = (root: string) => `sightread: starting a server for ${root}; the first request may take a while\n`;
+
 async function cli(...args: string[]) {
 	const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), ...args], {
 		env: { ...Bun.env },
+		stdout: "pipe",
+		stderr: "pipe",
 	});
 	const [code, out, err] = await Promise.all([
 		child.exited,
@@ -184,7 +195,7 @@ test("a long XDG runtime directory falls back for query, ps, and stop", async ()
 		expect(stateParent()).toBe(join(tmpdir(), `sightread-${process.getuid?.() ?? 0}`));
 		const query = await cli("--cwd", disposable.root, JSON.stringify({ type: "lookup", query: "fallback" }));
 		expect(query.code).toBe(0);
-		expect(query.err).toBe("");
+		expect(query.err).toBe(announced(disposable.root));
 		expect(query.out).toContain("fallback  exported function  src/model.ts:1-1");
 		const listed = await cli("ps");
 		expect(listed.code).toBe(0);
@@ -216,7 +227,7 @@ test("an owned fallback parent is tightened", async () => {
 		expect(statSync(unsafeParent).mode & 0o777).toBe(0o700);
 		const query = await cli("--cwd", disposable.root, JSON.stringify({ type: "lookup", query: "safeFallback" }));
 		expect(query.code).toBe(0);
-		expect(query.err).toBe("");
+		expect(query.err).toBe(announced(disposable.root));
 		expect(query.out).toContain("safeFallback  exported function  src/model.ts:1-1");
 	} finally {
 		await stopServer(project(disposable.root));
@@ -305,7 +316,7 @@ test("concurrent CLI processes start one server", async () => {
 		JSON.stringify({ type: "lookup", query: "greet" }),
 	];
 	const calls = Array.from({ length: 2 }, () =>
-		Bun.spawn(args, { cwd: first.root, env: { ...Bun.env, XDG_RUNTIME_DIR: runtime } }),
+		Bun.spawn(args, { cwd: first.root, env: { ...Bun.env, XDG_RUNTIME_DIR: runtime }, stdout: "pipe", stderr: "pipe" }),
 	);
 	const outputs = await Promise.all(
 		calls.map(async (child) => ({
@@ -314,9 +325,11 @@ test("concurrent CLI processes start one server", async () => {
 			err: await new Response(child.stderr).text(),
 		})),
 	);
+	// Either may find no server and say it's starting one; neither says anything else.
+	expect(outputs.some((output) => output.err === announced(first.root))).toBe(true);
 	for (const output of outputs) {
 		expect(output.code).toBe(0);
-		expect(output.err).toBe("");
+		expect(["", announced(first.root)]).toContain(output.err);
 		expect(output.out).toContain("greet  exported function  src/model.ts:1-1");
 	}
 	expect((await listServers()).filter(({ project: root }) => root === first.root)).toHaveLength(1);
@@ -387,14 +400,12 @@ test("a quiet timestamp cannot evict a server during a query", async () => {
 	process.env.SIGHTREAD_DAEMON_QUERY_DELAY_MS = "3000";
 	try {
 		const firstServer = await connect(project(first.root));
-		const state = serverPaths(project(first.root)).state;
-		const before = (JSON.parse(await Bun.file(state).text()) as { lastUsed: number }).lastUsed;
+		const socket = serverPaths(project(first.root)).socket;
+		const lastUsed = async () => ((await exchange(socket, { type: "ping" })) as { lastUsed: number }).lastUsed;
+		const before = await lastUsed();
 		await Bun.sleep(50);
 		const query = firstServer.query(lookup("greet"), {});
-		await until(async () => {
-			const live = JSON.parse(await Bun.file(state).text()) as { lastUsed: number };
-			return live.lastUsed > before;
-		});
+		await until(async () => (await lastUsed()) > before);
 		const secondServer = await connect(project(second.root));
 		expect((await listServers()).map(({ pid }) => pid).toSorted()).toEqual(
 			[firstServer.pid, secondServer.pid].toSorted(),
@@ -422,6 +433,8 @@ try {
 			SIGHTREAD_MAX_SERVERS: "1",
 			SIGHTREAD_DAEMON_START_DELAY_MS: "1000",
 		},
+		stdout: "pipe",
+		stderr: "pipe",
 	});
 	const [exit, stdout, stderr] = await Promise.all([
 		child.exited,
@@ -518,7 +531,7 @@ test("a cold start in one project does not block a warm query in another", async
 		return value;
 	});
 	try {
-		await until(async () => existsSync(serverPaths(project(first.root)).lock));
+		await until(() => lockHeld(serverPaths(project(first.root)).lock));
 		const start = performance.now();
 		const output = await (await connect(project(second.root))).query(lookup("other"), {});
 		expect(output).toContain("other  exported function  src/other.ts:1-1");
@@ -593,3 +606,177 @@ test("a hung stop reports the stop timeout and log path", async () => {
 		await until(async () => !(await listServers()).some(({ project: root }) => root === current.root), 10_000);
 	}
 }, 15_000);
+
+test("a reply split inside a character is decoded whole", async () => {
+	const socketPath = join(mkdtempSync(join(realpathSync("/tmp"), "sr-utf8-")), "s");
+	const reply = Buffer.from(`${JSON.stringify({ value: "café ✓" })}\n`);
+	// Split inside "é", whose two bytes come first in the reply after "caf".
+	const split = reply.indexOf(Buffer.from("é")) + 1;
+	const server = createServer((socket) =>
+		socket.once("data", () => {
+			socket.write(reply.subarray(0, split));
+			setTimeout(() => socket.end(reply.subarray(split)), 20);
+		}),
+	);
+	await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+	try {
+		expect(await exchange(socketPath, { type: "ping" })).toBe("café ✓");
+	} finally {
+		server.close();
+	}
+});
+
+test("starters never hold the start lock together, and a holder that dies frees it", async () => {
+	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-")), "start.lock");
+	let holding = 0;
+	let most = 0;
+	await Promise.all(
+		Array.from({ length: 20 }, () =>
+			withStartLock(path, async () => {
+				most = Math.max(most, ++holding);
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				holding--;
+			}),
+		),
+	);
+	expect(most).toBe(1);
+	// Another process takes it and is killed holding it: the lock is free again, with nothing to reclaim.
+	const holder = Bun.spawn(
+		[
+			process.execPath,
+			"-e",
+			`import { withStartLock } from ${JSON.stringify(join(import.meta.dir, "../src/server/lock.ts"))};
+await withStartLock(${JSON.stringify(path)}, async () => { console.log("held"); await new Promise(() => {}); });`,
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const reader = holder.stdout.getReader();
+	expect(new TextDecoder().decode((await reader.read()).value)).toContain("held");
+	expect(await lockHeld(path)).toBe(true);
+	holder.kill("SIGKILL");
+	await holder.exited;
+	expect(await lockHeld(path)).toBe(false);
+	let taken = false;
+	await withStartLock(path, async () => {
+		taken = true;
+	});
+	expect(taken).toBe(true);
+}, 30_000);
+
+test("a lock a Node process holds is seen and waited for under Bun, and freed when that process is killed", async () => {
+	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-node-lock-")), "start.lock");
+	const holder = Bun.spawn(
+		[
+			node,
+			"-e",
+			`const { withStartLock } = await import(${JSON.stringify(join(import.meta.dir, "../src/server/lock.ts"))});
+// A lock doesn't keep its holder running, so this does.
+setInterval(() => {}, 1_000);
+await withStartLock(${JSON.stringify(path)}, async () => { console.log("held"); await new Promise(() => {}); });`,
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const reader = holder.stdout.getReader();
+	expect(new TextDecoder().decode((await reader.read()).value)).toContain("held");
+	expect(await lockHeld(path)).toBe(true);
+	let taken = false;
+	const taking = withStartLock(path, async () => {
+		taken = true;
+	});
+	await Bun.sleep(300);
+	expect(taken).toBe(false);
+	// Killed, it leaves its socket behind, which the waiting taker removes.
+	holder.kill("SIGKILL");
+	await holder.exited;
+	await taking;
+	expect(taken).toBe(true);
+	expect(await lockHeld(path)).toBe(false);
+}, 30_000);
+
+test("the built package under Node and its source under Bun give a project one signature", async () => {
+	const built = Bun.spawnSync([
+		join(import.meta.dir, "../../../node_modules/.bin/tsc"),
+		"-p",
+		join(import.meta.dir, "../tsconfig.build.json"),
+	]);
+	expect(built.exitCode).toBe(0);
+	const signature = join(import.meta.dir, "../dist/server/signature.js");
+	const fromNode = Bun.spawnSync([
+		node,
+		"-e",
+		`const { projectSignature } = await import(${JSON.stringify(signature)}); console.log(await projectSignature(${JSON.stringify(project(first.root))}));`,
+	]);
+	expect(fromNode.stdout.toString().trim()).toBe(await projectSignature(project(first.root)));
+}, 30_000);
+
+test("a Node CLI and a Bun CLI starting together share one server", async () => {
+	await stopServer(project(first.root));
+	const request = JSON.stringify({ type: "lookup", query: "greet" });
+	const outputs = await Promise.all(
+		[node, process.execPath].map(async (executable) => {
+			const child = Bun.spawn([executable, join(import.meta.dir, "../src/cli.ts"), "--cwd", first.root, request], {
+				env: { ...Bun.env, XDG_RUNTIME_DIR: runtime },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return { code: await child.exited, out: await new Response(child.stdout).text() };
+		}),
+	);
+	for (const output of outputs) {
+		expect(output.code).toBe(0);
+		expect(output.out).toContain("greet  exported function  src/model.ts:1-1");
+	}
+	expect((await listServers()).filter(({ project: root }) => root === first.root)).toHaveLength(1);
+}, 45_000);
+
+test("a start lock held by a live process times out instead of waiting forever", async () => {
+	const path = join(mkdtempSync(join(realpathSync("/tmp"), "sr-lock-wait-")), "start.lock");
+	const { promise: holding, resolve: release } = Promise.withResolvers<void>();
+	const held = withStartLock(path, () => holding);
+	await until(() => lockHeld(path));
+	const started = Date.now();
+	try {
+		expect(await withStartLock(path, async () => "taken").catch((error: Error) => error.message)).toBe(
+			"server start lock timed out; retry",
+		);
+		expect(Date.now() - started).toBeGreaterThanOrEqual(15_000);
+	} finally {
+		release();
+		await held;
+	}
+}, 30_000);
+
+test("stopping a server that has stopped answering fails, and leaves its socket", async () => {
+	await stopAllServers();
+	const current = project(first.root);
+	const paths = serverPaths(current);
+	const stuck = await connect(current);
+	process.kill(stuck.pid, "SIGSTOP");
+	try {
+		expect(
+			await stopServer(current).then(
+				() => "stopped",
+				(error: Error) => error.message,
+			),
+		).toBe(`server is not responding; see ${paths.log}`);
+		expect(existsSync(paths.socket)).toBe(true);
+	} finally {
+		process.kill(stuck.pid, "SIGCONT");
+		await stopServer(current);
+	}
+}, 45_000);
+
+test("a second daemon for a project exits and leaves the first serving", async () => {
+	await stopAllServers();
+	const current = project(first.root);
+	const running = await connect(current);
+	const daemon = Bun.spawn(
+		[process.execPath, join(import.meta.dir, "../src/cli.ts"), "--daemon", current.root, current.tsconfig],
+		{ cwd: current.root, env: { ...Bun.env, XDG_RUNTIME_DIR: runtime }, stdout: "pipe", stderr: "pipe" },
+	);
+	expect(await daemon.exited).not.toBe(0);
+	expect(await new Response(daemon.stderr).text()).toContain("another server holds this project's lock");
+	const again = await connect(current);
+	expect(again.pid).toBe(running.pid);
+	expect(await again.query(lookup("greet"), {})).toContain("greet  exported function  src/model.ts:1-1");
+}, 45_000);

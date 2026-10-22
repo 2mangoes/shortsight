@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 // Parse the sightread command and route requests to a project daemon.
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -71,9 +71,9 @@ async function showHelp(cwd: string): Promise<string> {
 				"",
 				"--json prints an array with one result per request: its type, its nodes and any edges between them,",
 				"or an error. A node has handle, name, file and line ranges. A reference also has line, col, endCol,",
-				"its line's text, and call: the call's range and each argument's. Lines and columns count from 1,",
-				"columns in UTF-16 code units, and ends are exclusive. Many references make a large result: write",
-				"it to a file and read what you need from there.",
+				"its line's text, call: the call's range and each argument's, and inType when it's a use in a type.",
+				"Lines and columns count from 1, columns in UTF-16 code units, and ends are exclusive. Many",
+				"references make a large result: write it to a file and read what you need from there.",
 				"",
 				"Request types:",
 			];
@@ -148,7 +148,7 @@ async function main(args: string[]): Promise<string> {
 		throw new Error("usage: sightread [--cwd DIR] [--in DIR] [--json | --raw] '<JSON request or array>'");
 	if (positionals.length === 1 && ["--help", "-h"].includes(positionals[0])) return showHelp(cwd);
 	if (positionals.length === 1 && positionals[0] === "--skill")
-		return readFile(join(import.meta.dir, "../skills/sightread/SKILL.md"), "utf8");
+		return readFile(join(import.meta.dirname, "../skills/sightread/SKILL.md"), "utf8");
 	if (positionals[0] === "ps" && positionals.length === 1) {
 		return (await listServers())
 			.map(({ pid, project, lastUsed }) => `${pid}\t${project}\t${new Date(lastUsed).toISOString()}`)

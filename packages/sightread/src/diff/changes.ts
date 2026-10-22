@@ -1,6 +1,7 @@
 // Match changed source lines to the smallest syntax declarations in both versions.
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import type { GraphNode } from "../model.ts";
 import { graphKind } from "../naming.ts";
 import { handleFor, indexedDeclarations, type Declaration, type DeclarationParser } from "../ranges.ts";
@@ -22,13 +23,24 @@ export interface MatchedChanges {
 	notes: string[];
 	files: Map<string, GitFile>;
 	current: Map<string, Declaration[]>;
+	/** Whether the project's program loads a file, given its absolute path, a sibling package's included. */
+	inProgram: (absolute: string) => boolean;
 }
 
 const key = (item: Declaration) => `${item.name}:${item.kind}`;
-const smallest = (items: Declaration[], line: number) =>
-	items
-		.filter(({ start, end }) => start <= line && line <= end)
-		.toSorted((a, b) => a.end - a.start - (b.end - b.start))[0];
+// The declarations a changed line belongs to: every one holding it, such as `a` and `b` in
+// `export function a() {} export function b() {`, since lines can't tell which changed. Of a declaration and its own
+// members or locals, the nearer: a member on a line of its own, but a container on one line stands for its members.
+const span = ({ start, end }: Declaration) => end - start;
+const within = (inner: Declaration, outer: Declaration) => inner.name.startsWith(`${outer.name}.`);
+const holders = (items: Declaration[], line: number) => {
+	const holding = items.filter(({ start, end }) => start <= line && line <= end);
+	return holding.filter(
+		(item) =>
+			!holding.some((other) => within(other, item) && span(other) < span(item)) &&
+			!holding.some((other) => within(item, other) && span(other) === span(item)),
+	);
+};
 const ranges = (items: Declaration[]) => items.map(({ start, end }) => ({ start, end }));
 
 /** Attribute changed hunks and lost declarations without graph edges. */
@@ -36,8 +48,12 @@ export async function matchChanges(
 	git: GitChanges,
 	projectRoot: string,
 	parser: DeclarationParser,
+	/** Whether the project's program loads a file, given its absolute path, as one a sibling package holds. */
+	inProgram: (absolute: string) => boolean = () => false,
 ): Promise<MatchedChanges> {
 	const changed: ChangedSymbol[] = [];
+	// A class's, an interface's, a type's or an object literal's properties and methods, as opposed to its locals.
+	const memberSymbols = new Set<ChangedSymbol>();
 	const notes: string[] = [];
 	const files = new Map<string, GitFile>();
 	const current = new Map<string, Declaration[]>();
@@ -45,7 +61,11 @@ export async function matchChanges(
 	let outside = 0;
 	for (const file of git.files) {
 		const local = git.projectPath(file.path);
-		if (local.outside) {
+		// A file outside the project's directory is still the project's when its program loads it, as the graph's
+		// handles name it: relative to the project, as `../lib/shared.ts`.
+		const absolute = resolve(git.repository, file.path);
+		const loaded = local.outside && inProgram(absolute);
+		if (local.outside && !loaded) {
 			if (outside++ < 10) notes.push(`${file.path}: outside project`);
 			continue;
 		}
@@ -53,7 +73,7 @@ export async function matchChanges(
 			if (nonTs++ < 10) notes.push(`${file.path}: not TypeScript`);
 			continue;
 		}
-		const localPath = local.path!;
+		const localPath = loaded ? relative(realpathSync(projectRoot), absolute).split(sep).join("/") : local.path!;
 		files.set(localPath, file);
 		if (file.oldPath) notes.push(`${file.oldPath} → ${file.path}: file rename`);
 		const source = file.status === "deleted" ? undefined : await readFile(join(projectRoot, localPath), "utf8");
@@ -69,30 +89,28 @@ export async function matchChanges(
 		let outsideDeclaration = false;
 		if (file.status === "untracked" || file.status === "added") now.forEach((item) => selected.add(key(item)));
 		else {
+			const present = new Set(now.map(key));
+			const newLines = source?.split(/\r\n|\n|\r/) ?? [];
+			const oldLines = old?.split(/\r\n|\n|\r/) ?? [];
+			// A changed line no declaration holds, other than a blank one, is an import or other module-level code.
+			const attribute = (
+				items: Declaration[],
+				text: string[],
+				line: number,
+				edited: (item: Declaration) => boolean,
+			) => {
+				const found = holders(items, line);
+				for (const item of found) if (edited(item)) selected.add(key(item));
+				if (!found.length && text[line - 1]?.trim()) outsideDeclaration = true;
+			};
 			for (const hunk of file.hunks) {
-				let matched = false;
-				if (hunk.newCount) {
-					for (let line = hunk.newStart; line < hunk.newStart + hunk.newCount; line++) {
-						const item = smallest(now, line);
-						if (item) {
-							selected.add(key(item));
-							matched = true;
-						}
-					}
-				} else {
-					const item = smallest(now, Math.max(1, hunk.newStart));
-					if (
-						item &&
-						before.some(
-							(prior) => key(prior) === key(item) && prior.start <= hunk.oldStart && hunk.oldStart <= prior.end,
-						)
-					) {
-						selected.add(key(item));
-						matched = true;
-					}
-				}
-				if (!matched && !before.some((prior) => prior.start <= hunk.oldStart && hunk.oldStart <= prior.end))
-					outsideDeclaration = true;
+				// An added or changed line belongs to the declarations holding it now.
+				for (let line = hunk.newStart; line < hunk.newStart + hunk.newCount; line++)
+					attribute(now, newLines, line, () => true);
+				// A removed line belongs to the declarations that held it before, such as an overload taken out: one that
+				// remains is edited, and one that's gone is deleted.
+				for (let line = hunk.oldStart; line < hunk.oldStart + hunk.oldCount; line++)
+					attribute(before, oldLines, line, (item) => present.has(key(item)));
 			}
 		}
 		if (outsideDeclaration) notes.push(`${file.path}: imports changed`);
@@ -115,20 +133,25 @@ export async function matchChanges(
 				...(status === "moved" ? { oldPath: file.oldPath } : {}),
 				...(status === "deleted" ? { baseRanges: ranges(oldMembers) } : {}),
 			};
-			changed.push({ node, codeStarts: members.map(({ codeStart }) => codeStart), file });
+			const symbol = { node, codeStarts: members.map(({ codeStart }) => codeStart), file };
+			changed.push(symbol);
+			if (first.kind === "property" || first.kind === "method") memberSymbols.add(symbol);
 		}
 	}
 	if (nonTs > 10) notes.push(`... ${nonTs - 10} more non-TS files`);
 	if (outside > 10) notes.push(`... ${outside - 10} more outside-project files`);
-	const containers = changed.filter(
-		({ node }) => (node.kind === "class" || node.kind === "interface") && node.status !== "edited",
-	);
+	// An added or deleted declaration stands for its members, which changed with it.
+	const containers = changed.filter(({ node }) => node.status !== "edited");
 	return {
+		inProgram,
 		changed: changed.filter(
-			({ node }) =>
+			(symbol) =>
+				!memberSymbols.has(symbol) ||
 				!containers.some(
 					({ node: parent }) =>
-						parent.file === node.file && parent.status === node.status && node.name.startsWith(`${parent.name}.`),
+						parent.file === symbol.node.file &&
+						parent.status === symbol.node.status &&
+						symbol.node.name.startsWith(`${parent.name}.`),
 				),
 		),
 		notes,

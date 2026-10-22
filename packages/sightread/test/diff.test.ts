@@ -727,10 +727,10 @@ test("added and deleted containers stand for their members", async () => {
 	f.put("client/src/old.ts", "\n");
 	f.put(
 		"client/src/new.ts",
-		"export class New {\n\tmethod() { return 1; }\n}\nexport interface Fresh {\n\tvalue: number;\n}\n",
+		"export class New {\n\tmethod() { return 1; }\n}\nexport interface Fresh {\n\tvalue: number;\n}\nexport type Shape = {\n\tside: number;\n};\nexport const tools = {\n\tmeasure() { return 1; },\n};\n",
 	);
 	expect(await f.run()).toBe(
-		`diff against ${f.sha.slice(0, 12)} in client: 4 changed · used by 0 · tested by 0 files\n\nclient/src/old.ts\n  1-3  Old  deleted (base lines)\n  └─ no callers\n  4-6  Gone  deleted (base lines)\n  └─ no callers\n\nclient/src/new.ts  (new file)\n  1-3  New  added\n  4-6  Fresh  added`,
+		`diff against ${f.sha.slice(0, 12)} in client: 6 changed · used by 0 · tested by 0 files\n\nclient/src/old.ts\n  1-3  Old  deleted (base lines)\n  └─ no callers\n  4-6  Gone  deleted (base lines)\n  └─ no callers\n\nclient/src/new.ts  (new file)\n    1-3  New  added\n    4-6  Fresh  added\n    7-9  Shape  added\n  10-12  tools  added`,
 	);
 }, 30_000);
 
@@ -854,3 +854,127 @@ test("test sites with and without name matching have separate rows", () => {
 	);
 	expect(text).toContain("tests\nsrc/api.test.ts\n  target on line 4  (by name)\n  target on line 8");
 });
+
+test("declarations sharing a changed line are each attributed, since lines can't tell them apart", async () => {
+	const f = fixture({
+		"client/src/values.ts": "export const a = 1, b = 2;\nexport function useB() {\n\treturn b;\n}\n",
+	});
+	f.put("client/src/values.ts", "export const a = 1, b = 3;\nexport function useB() {\n\treturn b;\n}\n");
+	const output = await f.run();
+	expect(output).toStartWith(`diff against ${f.sha.slice(0, 12)} in client: 2 changed · used by 1`);
+	expect(output).toContain("1-1  a  edited");
+	expect(output).toContain("1-1  b  edited\n  └─ accessed by client/src/values.ts:2-4  useB");
+}, 30_000);
+
+test("a file the project's roots import is in the project", async () => {
+	const f = fixture({
+		"client/src/main.ts": 'import { impl } from "./impl.ts";\nexport const main = () => impl();\n',
+		"client/src/impl.ts": "export function impl() {\n\treturn 1;\n}\n",
+	});
+	f.put(
+		"client/tsconfig.json",
+		'{"compilerOptions":{"allowImportingTsExtensions":true,"noEmit":true},"files":["src/main.ts"]}\n',
+	);
+	git(f.repo, "add", "client/tsconfig.json");
+	git(f.repo, "commit", "-qm", "only main is a root");
+	f.put("client/src/impl.ts", "export function impl() {\n\treturn 2;\n}\n");
+	const output = await f.run();
+	expect(output).not.toContain("outside the graphed project");
+	expect(output).toContain("1-3  impl  edited\n  └─ called by client/src/main.ts:2-2  main");
+}, 30_000);
+
+test("an overload taken out edits the function it belonged to", async () => {
+	const f = fixture({
+		"client/src/format.ts":
+			"export function a() {}\nexport function f(x: string): string;\nexport function f(x: string | number) {\n\treturn x;\n}\n",
+	});
+	f.put("client/src/format.ts", "export function a() {}\nexport function f(x: string | number) {\n\treturn x;\n}\n");
+	const output = await f.run();
+	expect(output).toStartWith(`diff against ${f.sha.slice(0, 12)} in client: f edited`);
+	expect(output).not.toContain("  a  ");
+}, 30_000);
+
+test("a changed line belongs to every declaration on it, of whatever length", async () => {
+	const f = fixture({
+		"client/src/pair.ts": "export function a() { return 1; } export function b(x: number) {\n\treturn x;\n}\n",
+	});
+	f.put("client/src/pair.ts", "export function a() { return 1; } export function b(x: string) {\n\treturn x;\n}\n");
+	const output = await f.run();
+	expect(output).toContain("  a  edited");
+	expect(output).toContain("  b  edited");
+}, 30_000);
+
+test("a sibling package's file the project imports is diffed, with callers in other packages", async () => {
+	const f = fixture({
+		"lib/shared.ts": "export function shared() {\n\treturn 1;\n}\n",
+		"other/use.ts": 'import { shared } from "../lib/shared.ts";\nexport function viaOther() {\n\treturn shared();\n}\n',
+		"client/src/app.ts": 'import { viaOther } from "../../other/use.ts";\nexport const app = () => viaOther();\n',
+	});
+	f.put(
+		"client/tsconfig.json",
+		'{"compilerOptions":{"allowImportingTsExtensions":true,"noEmit":true,"module":"nodenext"},"include":["src"]}\n',
+	);
+	git(f.repo, "add", "client/tsconfig.json");
+	git(f.repo, "commit", "-qm", "only src is a root");
+	f.put("lib/shared.ts", "export function shared() {\n\treturn 2;\n}\n");
+	const output = await f.run();
+	expect(output).not.toContain("outside the project");
+	expect(output).toContain(
+		"lib/shared.ts\n  1-3  shared  edited\n  └─ called by other/use.ts:2-4  viaOther\n     └─ called by client/src/app.ts:2-2  app",
+	);
+}, 30_000);
+
+test("callers the graph leaves out through a dispatch to 12 or more implementations are noted", async () => {
+	const implementations = Array.from({ length: 12 }, (_, index) => index);
+	const f = fixture({
+		"client/src/shape.ts": `export interface Shape {\n\tarea(): number;\n}\n${implementations
+			.map((index) => `export class Shape${index} implements Shape {\n\tarea() {\n\t\treturn ${index};\n\t}\n}\n`)
+			.join("")}`,
+		"client/src/use.ts":
+			'import type { Shape } from "./shape.ts";\nexport function total(shape: Shape) {\n\treturn shape.area();\n}\n',
+	});
+	const changed = (await Bun.file(join(f.root, "src/shape.ts")).text()).replace("return 3;", "return 33;");
+	f.put("client/src/shape.ts", changed);
+	expect(await f.run()).toContain("Shape3.area: callers through a dispatch to 12 or more implementations left out");
+}, 30_000);
+
+test("a textconv filter doesn't change the lines a diff attributes", async () => {
+	const f = fixture({
+		"client/src/values.ts": "export function a() {\n\treturn 1;\n}\nexport function b() {\n\treturn 2;\n}\n",
+	});
+	// A filter that drops every `export` line, so its hunks would put b's change on a's lines.
+	f.put("client/.gitattributes", "*.ts diff=dropper\n");
+	git(f.repo, "config", "diff.dropper.textconv", "grep -v export");
+	git(f.repo, "add", "client/.gitattributes");
+	git(f.repo, "commit", "-qm", "attributes");
+	f.put("client/src/values.ts", "export function a() {\n\treturn 1;\n}\nexport function b() {\n\treturn 3;\n}\n");
+	const output = await f.run();
+	expect(output).toContain("4-6  b  edited");
+	expect(output).not.toContain("  a  edited");
+}, 30_000);
+
+test("a Git that fails isn't read as a file the base doesn't have", async () => {
+	const f = fixture({ "client/src/a.ts": "export function a() {\n\treturn 1;\n}\n" });
+	f.put("client/src/a.ts", "export function a() {\n\treturn 2;\n}\n");
+	// A git whose `show` writes more than diff reads, as one that fails would.
+	const bin = mkdtempSync(join(temporaryRoot, "sightread-git-"));
+	const real = Bun.which("git")!;
+	writeFileSync(
+		join(bin, "git"),
+		`#!/bin/sh\nfor arg in "$@"; do [ "$arg" = show ] && exec head -c 40000000 /dev/zero; done\nexec ${real} "$@"\n`,
+		{ mode: 0o755 },
+	);
+	const path = process.env.PATH;
+	process.env.PATH = `${bin}:${path}`;
+	try {
+		expect(
+			await f.run().then(
+				() => "ran",
+				(error: Error) => error.message,
+			),
+		).not.toBe("ran");
+	} finally {
+		process.env.PATH = path;
+		rmSync(bin, { recursive: true, force: true });
+	}
+}, 30_000);

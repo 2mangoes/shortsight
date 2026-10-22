@@ -1,5 +1,6 @@
 // Run one working-tree diff with one parser and the existing graph daemon.
-import { projectFiles, type Project } from "../project.ts";
+import { programFiles, type Project } from "../project.ts";
+import { realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createPaths } from "../paths.ts";
 import { createDeclarationParser } from "../ranges.ts";
@@ -7,6 +8,14 @@ import { matchChanges } from "./changes.ts";
 import { readGitChanges } from "./git.ts";
 import { collectImpact } from "./impact.ts";
 import { formatDiffNotes, renderDiffText, type DiffResult } from "./render.ts";
+
+const realOrSelf = (file: string) => {
+	try {
+		return realpathSync(file);
+	} catch {
+		return file;
+	}
+};
 
 /** Compare the chosen commit with disk and return complete text or JSON output. */
 export async function runDiff(
@@ -18,10 +27,14 @@ export async function runDiff(
 	const paths = createPaths(project.root, git.repository);
 	const parser = createDeclarationParser();
 	try {
-		const matched = await matchChanges(git, project.root, parser);
-		const files = await projectFiles(project);
+		// Every file the compiler loads for the project, not only its config's roots: an imported file is in it too, a
+		// sibling package's included.
+		const files = await programFiles(project);
+		// Git names files by their real paths; the program may name them through a symlink, as /tmp on macOS.
+		const real = new Set([...files].map((file) => realOrSelf(file)));
+		const matched = await matchChanges(git, project.root, parser, (absolute) => real.has(realOrSelf(absolute)));
 		const inProject = ({ node, file }: (typeof matched.changed)[number]) =>
-			files.has(resolve(project.root, node.file)) ||
+			(files.has(resolve(project.root, node.file)) && !/\.d\.[cm]?ts$/.test(node.file)) ||
 			// A deleted file isn't on disk to check against the config, so count it if it was inside the project.
 			(file.status === "deleted" &&
 				!node.file.startsWith("../") &&

@@ -1,4 +1,4 @@
-// Answer for declarations the graph has no node for, such as a type literal's members, from their own parse.
+// Answer for declarations the graph has no node for, such as an enum's members, from their own parse.
 import { fromHandle, object } from "./model.ts";
 import { graphKind, type DeclarationKind } from "./naming.ts";
 import { graphNameOf, type Declaration, type RangeIndex } from "./ranges.ts";
@@ -19,8 +19,6 @@ function why(declaration: Declaration): string {
 	switch (declaration.unindexed) {
 		case "local":
 			return `it's local to ${owner} and holds no function`;
-		case "shared":
-			return `it shares the name ${declaration.graphName} with another declaration in its file`;
 		default:
 			return `it's a member of ${owner}`;
 	}

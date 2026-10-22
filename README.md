@@ -2,8 +2,8 @@
 
 Two tools for coding agents working on TypeScript and JavaScript repositories:
 
-- `shorthand` lets an agent change a repository by writing a small program, so a change that touches many files is one step instead of many.
 - `sightread` shows how a codebase fits together, so an agent reads only the code it needs.
+- `shorthand` lets an agent change a repository by writing a small program, so a change that touches many files is one step instead of many.
 
 Each works on its own.
 
@@ -18,6 +18,22 @@ npm config set @2mangoes:registry https://registry.npmjs.org --location=user
 ```
 
 Remove or update any project-level `@2mangoes:registry` entry that still points to GitHub Packages. No GitHub token is needed. See [publishing instructions](docs/publishing.md) for maintainers.
+
+## `sightread`
+
+![What a change to getMimeType affects in hono](https://raw.githubusercontent.com/2mangoes/shortsight/main/docs/sightread.png)
+
+`sightread` shows what calls what in a TypeScript codebase, and the exact lines each piece of code spans. It asks the TypeScript compiler, so it follows imports, aliases and re-exports that text search misses.
+
+### Install
+
+It runs on [Node](https://nodejs.org) 22 or later, or [Bun](https://bun.sh) 1.4 or later:
+
+```sh
+npm i -g @2mangoes/sightread
+```
+
+Usage is in [`sightread`'s README](packages/sightread/README.md).
 
 ## `shorthand`
 
@@ -60,22 +76,6 @@ npm i -g @2mangoes/shorthand-code
 ```
 
 Usage is in [pi-shorthand's README](packages/pi-shorthand/README.md) and [shorthand-code's README](packages/shorthand-code/README.md).
-
-## `sightread`
-
-![What a change to getMimeType affects in hono](https://raw.githubusercontent.com/2mangoes/shortsight/main/docs/sightread.png)
-
-`sightread` shows what calls what in a TypeScript codebase, and the exact lines each piece of code spans. It asks the TypeScript compiler, so it follows imports, aliases and re-exports that text search misses.
-
-### Install
-
-Install [Bun](https://bun.sh) 1.4 or later, then:
-
-```sh
-npm i -g @2mangoes/sightread
-```
-
-Usage is in [`sightread`'s README](packages/sightread/README.md).
 
 ## Together
 

@@ -181,9 +181,9 @@ test("reverse trace honors maxNodes and maxDepth, and says which bound cut it", 
 	expect(many.note).toBe(
 		"stopped at 35 symbols; trace from a narrower symbol; only direct users are shown, since there are more than 32; pass maxDepth to follow their users too",
 	);
-	// A depth asked for ends the walk without truncating it.
+	// A walk that reached the depth asked for, with users beyond it, says to raise the depth.
 	const one = await ask(undefined, 1);
-	expect([one.shown, one.raise, one.note]).toEqual([41, undefined, undefined]);
+	expect([one.shown, one.raise, one.note]).toEqual([41, "trace.maxDepth", undefined]);
 	expect((await ask(undefined, 2)).shown).toBe(42);
 	// With more direct users than 32, the default is one level; asked, never more than eight.
 	const hub = await ask();
@@ -353,4 +353,210 @@ test("--in keeps each details neighbour list pointing at its own edges", async (
 		result.sections[key].map((index) => `${result.edges[index].from} → ${result.edges[index].to}`);
 	expect(named("calls")).toEqual(["src/a.ts#get:function → src/a.ts#normalise:function"]);
 	expect(named("dependedOnBy")).toEqual(["src/a.ts#inside:function → src/a.ts#get:function"]);
+});
+
+test("--in keeps a tour's steps pointing at its own edges", async () => {
+	const seed = (id: string, line: number) => ({ ...symbol(id), file: id.split("#")[0], line });
+	const tourClient: GraphClient = {
+		...client,
+		query: async () => ({
+			value: {
+				result: {
+					type: "tour",
+					seeds: [
+						seed("src/b.ts#outside:function", 3),
+						seed("src/a.ts#inside:function", 4),
+						seed("src/a.ts#target:function", 1),
+					],
+					primaryFlow: {
+						steps: ["outside -[calls at src/b.ts:3]-> target", "inside -[calls at src/a.ts:4]-> target"],
+					},
+				},
+			},
+			isError: false,
+		}),
+	};
+	const [result] = JSON.parse(
+		await runQuery({ client: tourClient, ranges, root: "/tmp" }, [{ type: "tour" }], { mode: "json", in: "src/a.ts" }),
+	) as Array<{ edges: Array<{ from: string; to: string }>; sections: { primaryFlow: { steps: number[] } } }>;
+	expect(
+		result.sections.primaryFlow.steps.map((index) => `${result.edges[index].from} → ${result.edges[index].to}`),
+	).toEqual(["src/a.ts#inside:function → src/a.ts#target:function"]);
+});
+
+test("a reverse trace reads maxNodes as the graph does, and says when the graph withheld a dispatch", async () => {
+	const target = "src/a.ts#target:function";
+	const { graph } = callerGraph({ [target]: [{ id: callerHandle(0) }, { id: callerHandle(1) }] });
+	for (const maxNodes of [0, -1]) {
+		const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target, maxNodes });
+		expect([result.shown, result.raise]).toEqual([1, "trace.maxNodes"]);
+		expect(result.note).toBe("stopped at 1 symbol; trace from a narrower symbol");
+	}
+	// The graph marks a walk truncated when it leaves out a dispatch to 12 or more implementations, with neither its
+	// budget full nor its depth reached; only `complete` follows it.
+	const withholding: GraphClient = {
+		...client,
+		query: async (request) => {
+			const { value } = await graph.query({ ...request, maxDepth: 1 });
+			return { value: { result: { ...(value as { result: object }).result, truncated: true } }, isError: false };
+		},
+	};
+	const withheld = await traceWith({ client: withholding, ranges, root: "/tmp" }, { from: target });
+	expect([withheld.shown, withheld.raise]).toEqual([2, "trace.complete"]);
+	expect(withheld.note).toBe("the graph left out a dispatch to 12 or more implementations; pass complete to follow it");
+});
+
+// A reference to `box.prop` on a line of a.ts, inside `handle`.
+const reference = (line: number, handle: string) => ({
+	handle: `a.ts#ref:${line}`,
+	name: "prop",
+	file: "a.ts",
+	ranges: null,
+	line,
+	col: 38,
+	endCol: 42,
+	in: { handle },
+});
+
+test("a member with no node keeps the request's options, follows complete, and says which users it couldn't trace", async () => {
+	const root = mkdtempSync(join(realpathSync("/tmp"), "sr-nodeless-options-"));
+	writeFileSync(
+		join(root, "a.ts"),
+		"export function first() { return box.prop; }\nexport function second() { return box.prop; }\n",
+	);
+	const start = "a.ts#Box.prop:variable";
+	const first = "a.ts#first:function";
+	const second = "a.ts#second:function";
+	const nodeless: RangeIndex = {
+		...ranges,
+		declarations: async () => [
+			{ name: "Box.prop", kind: "property", start: 1, end: 1, codeStart: 1, unindexed: "member" },
+		],
+	};
+	const references = {
+		query: async () => ({
+			type: "references",
+			shown: 2,
+			edges: [],
+			sections: {},
+			nodes: [reference(1, first), reference(2, second)],
+		}),
+		reexport: async () => undefined,
+		close: async () => {},
+	} as unknown as ReferenceIndex;
+	const { graph, sent } = callerGraph({ [first]: [{ id: "a.ts#outer:function" }] });
+	// The second user's own trace fails.
+	const failing: GraphClient = {
+		...graph,
+		query: async (request) => {
+			if (request.from === second) throw new Error("graph went away");
+			return graph.query(request);
+		},
+	};
+	try {
+		const context = { client: failing, ranges: nodeless, references, root };
+		const focused = await traceWith(context, { from: start, maxDepth: 2, focus: "execution" });
+		expect(sent.map(({ from, focus, maxDepth }) => [from, focus, maxDepth])).toEqual([[first, "execution", 1]]);
+		expect(focused.nodes.map(({ name }) => name).toSorted()).toEqual(["Box.prop", "first", "outer", "second"]);
+		expect(focused.note).toBe(
+			"Box.prop has no graph node, so its direct users come from its references; 1 symbol skipped",
+		);
+		sent.length = 0;
+		await traceWith(context, { from: start, complete: true });
+		expect(sent.map(({ from, complete, maxDepth }) => [from, complete, maxDepth])).toEqual([[first, true, undefined]]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a reverse trace whose hop budget ran out on its direct users says it left some out", async () => {
+	const target = "src/a.ts#target:function";
+	// Forty-one callers, each calling the target fifty times: 2,050 hops before any second level, past the hop budget
+	// of 2,000 that comes with 1,000 symbols.
+	const callers = Array.from({ length: 41 }, (_, index) => callerHandle(index));
+	const { graph } = callerGraph({ [target]: callers.flatMap((id) => Array.from({ length: 50 }, () => ({ id }))) });
+	const result = await traceWith({ client: graph, ranges, root: "/tmp" }, { from: target });
+	expect(result.shown).toBe(40);
+	expect(result.raise).toBe("trace.maxNodes");
+	expect(result.note).toStartWith("stopped at the graph's limit of 2000 hops");
+});
+
+test("a member with no node follows focus from its first hop", async () => {
+	const root = mkdtempSync(join(realpathSync("/tmp"), "sr-nodeless-focus-"));
+	writeFileSync(
+		join(root, "a.ts"),
+		"export function reads() { return box.prop; }\nexport type Typed = typeof box.prop;\n",
+	);
+	const start = "a.ts#Box.prop:variable";
+	const nodeless: RangeIndex = {
+		...ranges,
+		declarations: async () => [
+			{ name: "Box.prop", kind: "property", start: 1, end: 1, codeStart: 1, unindexed: "member" },
+		],
+	};
+	const references = {
+		query: async () => ({
+			type: "references",
+			shown: 2,
+			edges: [],
+			sections: {},
+			nodes: [reference(1, "a.ts#reads:function"), { ...reference(2, "a.ts#Typed:type"), inType: true }],
+		}),
+		reexport: async () => undefined,
+		close: async () => {},
+	} as unknown as ReferenceIndex;
+	const { graph } = callerGraph({});
+	try {
+		const kinds = async (focus?: string) =>
+			(
+				await traceWith(
+					{ client: graph, ranges: nodeless, references, root },
+					{ from: start, maxDepth: 1, ...(focus ? { focus } : {}) },
+				)
+			).edges.map(({ kind }) => kind);
+		expect(await kinds()).toEqual(["accesses", "type_ref"]);
+		expect(await kinds("execution")).toEqual(["accesses"]);
+		expect(await kinds("types")).toEqual(["type_ref"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a member with no node, traced one level, says when its users have users of their own", async () => {
+	const root = mkdtempSync(join(realpathSync("/tmp"), "sr-nodeless-depth-"));
+	writeFileSync(join(root, "a.ts"), "export function first() { return box.prop; }\n");
+	const nodeless: RangeIndex = {
+		...ranges,
+		declarations: async () => [
+			{ name: "Box.prop", kind: "property", start: 1, end: 1, codeStart: 1, unindexed: "member" },
+		],
+	};
+	const references = {
+		query: async () => ({
+			type: "references",
+			shown: 1,
+			edges: [],
+			sections: {},
+			nodes: [reference(1, "a.ts#first:function")],
+		}),
+		reexport: async () => undefined,
+		close: async () => {},
+	} as unknown as ReferenceIndex;
+	const used = (dependents: unknown[]): GraphClient => ({
+		...client,
+		query: async (request) => ({
+			value: {
+				result: { type: request.type, nodes: [{ ...symbol("a.ts#first:function"), dependedOnBy: dependents }] },
+			},
+			isError: false,
+		}),
+	});
+	try {
+		const trace = (graph: GraphClient) =>
+			traceWith({ client: graph, ranges: nodeless, references, root }, { from: "a.ts#Box.prop:variable", maxDepth: 1 });
+		expect((await trace(used([{ ...symbol("a.ts#outer:function"), relation: "calls" }]))).raise).toBe("trace.maxDepth");
+		expect((await trace(used([]))).raise).toBeUndefined();
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });

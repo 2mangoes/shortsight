@@ -1,7 +1,9 @@
 // Find the nearest TypeScript project and suggest nearby projects when none contains the start directory.
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { API } from "typescript/unstable/async";
+import { API, type Snapshot } from "typescript/unstable/async";
+import { closeAPI, untilExit } from "./api.ts";
+import { parseJSONC } from "./runtime.ts";
 
 export interface Project {
 	/** Absolute directory containing the tsconfig. */
@@ -18,14 +20,43 @@ const skipped = new Set([".llm-ephemeral", "node_modules", ".bare", ".git", "dis
 export async function projectFiles(project: Project, shared?: API): Promise<Set<string>> {
 	const api = shared ?? new API({ cwd: project.root });
 	try {
-		const parsed = await api.parseConfigFile(project.tsconfig);
+		const parsed = await untilExit(api, api.parseConfigFile(project.tsconfig));
 		return new Set(
 			parsed.fileNames
 				.filter((name) => /\.(?:ts|tsx|mts|cts)$/.test(name) && !/\.d\.(?:ts|mts|cts)$/.test(name))
 				.map((name) => resolve(name)),
 		);
 	} finally {
-		if (!shared) await api.close();
+		if (!shared) await closeAPI(api);
+	}
+}
+
+/** Every file a TypeScript program for the project loads outside node_modules: its roots and what they import. */
+export async function sourceFileNames(snapshot: Snapshot): Promise<Set<string>> {
+	const files = new Set<string>();
+	for (const opened of snapshot.getProjects())
+		for (const name of await opened.program.getSourceFileNames())
+			if (!name.split(/[\\/]/).includes("node_modules")) files.add(resolve(name));
+	return files;
+}
+
+/** The files the compiler loads for a project, as {@link sourceFileNames}, from a program built for the purpose. */
+export async function programFiles(project: Project): Promise<Set<string>> {
+	const api = new API({ cwd: project.root });
+	try {
+		return await untilExit(
+			api,
+			(async () => {
+				const snapshot = await api.updateSnapshot({ openProjects: [project.tsconfig] });
+				try {
+					return await sourceFileNames(snapshot);
+				} finally {
+					await snapshot.dispose();
+				}
+			})(),
+		);
+	} finally {
+		await closeAPI(api);
 	}
 }
 
@@ -65,7 +96,7 @@ function hasTsconfig(directory: string): boolean {
 }
 
 function configReferences(file: string): string[] {
-	const value: unknown = Bun.JSONC.parse(readFileSync(file, "utf8"));
+	const value: unknown = parseJSONC(readFileSync(file, "utf8"));
 	if (!value || typeof value !== "object") return [];
 	const config = value as { files?: unknown; include?: unknown; references?: unknown };
 	if (!Array.isArray(config.references) || config.references.length === 0) return [];
@@ -109,7 +140,7 @@ async function chosenConfig(solution: string, cwd: string): Promise<string> {
 		let bestContains = false;
 		let bestCount = -1;
 		for (const file of leaves) {
-			const parsed = await api.parseConfigFile(file);
+			const parsed = await untilExit(api, api.parseConfigFile(file));
 			const files = parsed.fileNames.filter(
 				(name) => /\.(?:ts|tsx|mts|cts)$/.test(name) && !/\.d\.(?:ts|mts|cts)$/.test(name),
 			);
@@ -125,7 +156,7 @@ async function chosenConfig(solution: string, cwd: string): Promise<string> {
 		}
 		return best;
 	} finally {
-		await api.close();
+		await closeAPI(api);
 	}
 }
 

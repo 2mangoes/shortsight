@@ -1,8 +1,10 @@
 // Query graph impact and add syntax-backed callers, chains, and direct test sites.
 import { readFile, stat } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { API } from "typescript/unstable/async";
-import { fromHandle, object, type GraphNode } from "../model.ts";
+import { closeAPI, untilExit } from "../api.ts";
+import { fromHandle, HOPS_PER_NODE, object, traceCut, type GraphNode } from "../model.ts";
 import type { Project } from "../project.ts";
 import { handleFor, indexedDeclarations, type Declaration, type DeclarationParser } from "../ranges.ts";
 import { connect, type ServerConnection } from "../server/client.ts";
@@ -42,14 +44,8 @@ const edgesOf = (value: unknown): Record<string, unknown>[] => {
 	const hops = result(value).hops;
 	return Array.isArray(hops) ? hops.filter((item): item is Record<string, unknown> => !!object(item)) : [];
 };
-// Truncated with a full budget: the budget cut the walk, not its depth.
-const capped = (value: unknown) => {
-	const reached = result(value).reached;
-	return (
-		result(value).truncated === true &&
-		((Array.isArray(reached) && reached.length >= IMPACT_LIMIT) || edgesOf(value).length >= IMPACT_LIMIT * 2)
-	);
-};
+// Its budget, not its depth, cut the walk.
+const capped = (value: unknown) => traceCut(result(value), IMPACT_LIMIT, 3) === "maxNodes";
 
 function searchable(item: ChangedSymbol, declarations: Declaration[]): boolean {
 	const indexed = indexedDeclarations(declarations);
@@ -71,7 +67,7 @@ interface ImportPaths {
 async function importPaths(project: Project): Promise<ImportPaths> {
 	const api = new API({ cwd: project.root });
 	try {
-		const { options } = await api.parseConfigFile(project.tsconfig);
+		const { options } = await untilExit(api, api.parseConfigFile(project.tsconfig));
 		const paths = options.paths;
 		return {
 			root: project.root,
@@ -88,7 +84,7 @@ async function importPaths(project: Project): Promise<ImportPaths> {
 					: {},
 		};
 	} finally {
-		await api.close();
+		await closeAPI(api);
 	}
 }
 
@@ -143,20 +139,30 @@ function importsFile(source: string, importer: string, target: string, config: I
 	return false;
 }
 
+// A file's path relative to the project: `../` for a sibling package's that the program loads, or undefined for one
+// outside it.
+function projectFile(git: GitChanges, project: Project, file: string, inProgram: (absolute: string) => boolean) {
+	const local = git.projectPath(file);
+	if (!local.outside) return local.path;
+	const absolute = resolve(git.repository, file);
+	return inProgram(absolute) ? relative(realpathSync(project.root), absolute).split(sep).join("/") : undefined;
+}
+
 async function relevantHits(
 	git: GitChanges,
 	project: Project,
 	item: ChangedSymbol,
 	includeOwnFile: boolean,
 	config: ImportPaths,
+	inProgram: (absolute: string) => boolean,
 ): Promise<Array<{ file: string; line: number }>> {
+	// Each hit by its path relative to the project.
 	const hits = await git.grep(item.node.name.split(".").at(-1)!);
 	const sources = new Map<string, string>();
 	const relevant: Array<{ file: string; line: number }> = [];
 	for (const hit of hits) {
-		const local = git.projectPath(hit.file);
-		if (local.outside || !local.path || !/\.(?:ts|tsx|mts|cts)$/.test(local.path)) continue;
-		const file = local.path;
+		const file = projectFile(git, project, hit.file, inProgram);
+		if (!file || !/\.(?:ts|tsx|mts|cts)$/.test(file)) continue;
 		if (file === item.node.file && !includeOwnFile) continue;
 		let source = sources.get(file);
 		if (source === undefined) {
@@ -180,7 +186,7 @@ async function relevantHits(
 			.at(-1)!
 			.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		if (!new RegExp(`(?<![\\w$])${name}(?![\\w$])`).test(code)) continue;
-		relevant.push(hit);
+		relevant.push({ file, line: hit.line });
 	}
 	return relevant;
 }
@@ -259,7 +265,9 @@ function createLookup(git: GitChanges, project: Project, parser: DeclarationPars
 	};
 	const nodeFor = async (handle: string): Promise<GraphNode | undefined> => {
 		const ref = fromHandle(handle);
-		if (!ref || git.projectPath(`${git.project === "." ? "" : `${git.project}/`}${ref.file}`).outside) return undefined;
+		// A caller in a sibling package is the graph's too, as `../lib/shared.ts`; one outside the repository isn't.
+		if (!ref || relative(git.repository, resolve(realpathSync(project.root), ref.file)).startsWith(".."))
+			return undefined;
 		const items = (await getDeclarations(ref.file)).filter((item) => handleFor(ref.file, item) === handle);
 		return {
 			handle,
@@ -380,11 +388,20 @@ async function graphChains(input: {
 			continue;
 		}
 		let edges = edgesOf(value);
-		if (capped(value)) {
-			notes.push(`${item.node.name}: impact truncated at ${IMPACT_LIMIT} callers; reverse trace used`);
+		const cut = traceCut(result(value), IMPACT_LIMIT, 3);
+		if (cut === "maxNodes") {
+			const hops = edgesOf(value).length >= IMPACT_LIMIT * HOPS_PER_NODE;
+			notes.push(
+				`${item.node.name}: impact truncated at ${hops ? `${IMPACT_LIMIT * HOPS_PER_NODE} hops` : `${IMPACT_LIMIT} callers`}; reverse trace used`,
+			);
 			value = reverseByIndex.get(index);
 			edges = [...edges, ...edgesOf(value)];
+			if (traceCut(result(value), REVERSE_LIMIT, 3) === "maxNodes")
+				notes.push(`${item.node.name}: callers truncated at ${REVERSE_LIMIT} in the reverse trace too`);
 		}
+		// The graph leaves out a dispatch to 12 or more implementations, so callers through it aren't shown.
+		if (cut === "complete")
+			notes.push(`${item.node.name}: callers through a dispatch to 12 or more implementations left out`);
 		const incoming = incomingEdges(item, edges, testMap);
 		await recordChains(findChains(item, incoming, changedHandles), nodeFor, callerMap, chains);
 	}
@@ -400,16 +417,16 @@ async function deletedCallers(input: {
 	callerMap: Map<string, GraphNode>;
 	chains: Impact["chains"];
 	config: ImportPaths;
+	inProgram: (absolute: string) => boolean;
 }) {
-	const { git, project, parser, changed, getDeclarations, nodeFor, callerMap, chains, config } = input;
+	const { git, project, parser, changed, getDeclarations, nodeFor, callerMap, chains, config, inProgram } = input;
 	const changedHandles = new Set(changed.map(({ node }) => node.handle));
 	for (const item of changed.filter(({ node }) => node.status === "deleted" || node.status === "moved")) {
 		const old = await git.baseText(item.file.oldPath ?? item.file.path);
 		if (!old || !searchable(item, await parser.parse(item.node.file, old))) continue;
 		const found = new Set<string>();
-		for (const hit of await relevantHits(git, project, item, nodeStatusOwnFile(item), config)) {
-			const local = git.projectPath(hit.file);
-			if (local.outside || !local.path) continue;
+		for (const hit of await relevantHits(git, project, item, nodeStatusOwnFile(item), config, inProgram)) {
+			const local = { path: hit.file };
 			const decl = (await getDeclarations(local.path))
 				.filter(({ start, end }) => start <= hit.line && hit.line <= end)
 				.toSorted((a, b) => a.end - a.start - (b.end - b.start))[0];
@@ -440,17 +457,18 @@ async function testSites(input: {
 	getDeclarations: Lookup["getDeclarations"];
 	testMap: Map<string, GraphNode & { byName?: true }>;
 	config: ImportPaths;
+	inProgram: (absolute: string) => boolean;
 }) {
-	const { git, project, parser, changed, getDeclarations, testMap, config } = input;
+	const { git, project, parser, changed, getDeclarations, testMap, config, inProgram } = input;
 	for (const item of changed) {
 		const declarations =
 			item.node.status === "deleted"
 				? await parser.parse(item.node.file, (await git.baseText(item.file.oldPath ?? item.file.path)) ?? "")
 				: await getDeclarations(item.node.file);
 		if (!searchable(item, declarations)) continue;
-		for (const hit of await relevantHits(git, project, item, false, config)) {
-			const local = git.projectPath(hit.file);
-			if (local.outside || !local.path || !testFile(local.path)) continue;
+		for (const hit of await relevantHits(git, project, item, false, config, inProgram)) {
+			const local = { path: hit.file };
+			if (!testFile(local.path)) continue;
 			const key = `${local.path}:${hit.line}:${item.node.name}`;
 			if (testMap.has(key)) continue;
 			testMap.set(key, {
@@ -483,8 +501,20 @@ export async function collectImpact(
 	const reverseByIndex = await reverseFallback(active, values, server);
 	const config = await importPaths(project);
 	await graphChains({ active, changed, values, reverseByIndex, notes, callerMap, testMap, chains, nodeFor });
-	await deletedCallers({ git, project, parser, changed, getDeclarations, nodeFor, callerMap, chains, config });
-	await testSites({ git, project, parser, changed, getDeclarations, testMap, config });
+	const { inProgram } = matched;
+	await deletedCallers({
+		git,
+		project,
+		parser,
+		changed,
+		getDeclarations,
+		nodeFor,
+		callerMap,
+		chains,
+		config,
+		inProgram,
+	});
+	await testSites({ git, project, parser, changed, getDeclarations, testMap, config, inProgram });
 	const tests = [...testMap.values()].toSorted((a, b) => a.file.localeCompare(b.file) || a.site!.start - b.site!.start);
 	if (tests.length > 200) notes.push(`... ${tests.length - 200} more direct test sites`);
 	return {

@@ -1,6 +1,6 @@
 {
 	"name": "@2mangoes/sightread",
-	"version": "0.15.0",
+	"version": "0.17.0",
 	"description": "Query a TypeScript project's compiler-resolved code graph from the shell: symbols, edges and exact line ranges for coding agents.",
 	"keywords": [
 		"code-graph",
@@ -17,29 +17,39 @@
 		"directory": "packages/sightread"
 	},
 	"bin": {
-		"sightread": "src/cli.ts"
+		"sightread": "dist/cli.js"
 	},
 	"files": [
+		"dist",
 		"src",
 		"skills",
 		"README.md"
 	],
 	"type": "module",
 	"exports": {
-		".": "./src/index.ts",
+		".": {
+			"bun": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"publishConfig": {
 		"access": "public",
 		"registry": "https://registry.npmjs.org"
 	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"prepack": "npm run build"
+	},
 	"dependencies": {
-		"@modelcontextprotocol/sdk": "1.31.0",
-		"@ttsc/graph": "0.33.0",
-		"ttsc": "0.33.0",
+		"@modelcontextprotocol/sdk": "1.32.1",
+		"@ttsc/graph": "0.33.1",
+		"ttsc": "0.33.1",
 		"typescript": "7.0.2"
 	},
 	"engines": {
-		"bun": ">=1.4"
+		"bun": ">=1.4",
+		"node": ">=22"
 	}
 }

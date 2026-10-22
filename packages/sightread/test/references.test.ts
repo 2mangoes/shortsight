@@ -3,6 +3,8 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { GraphResult } from "../src/model.ts";
+import { createPaths } from "../src/paths.ts";
+import { createReferenceIndex } from "../src/references.ts";
 import { renderText } from "../src/render.ts";
 import { createFixtureProject } from "./fixture.ts";
 
@@ -430,7 +432,7 @@ test("a reverse trace past 32 symbols follows every caller from its hub, in one 
 	expect(result.nodes.find(({ name }) => name === "outer0")?.exported).toBe(true);
 	const text = runIn(wide, JSON.stringify({ type: "trace", from: "target", direction: "reverse", maxDepth: 3 })).out;
 	expect(text).toStartWith(
-		`trace reverse from target: ${result.shown} shown in 82 files; 40 at depth 1, 44 at depth 2, 1 at depth 3\n`,
+		`trace reverse from target: ${result.shown} shown in 82 files; 40 at depth 1, 44 at depth 2, 41 at depth 3\n`,
 	);
 	expect(text).toContain(
 		"  5-5  Child.run               method             calls Base.run :5; overrides Base.run :5\n",
@@ -634,3 +636,75 @@ test("a completed trace from a hub stops at its direct users unless maxDepth say
 		fixture.cleanup();
 	}
 });
+
+test("references follow an edit to a file the project only imports", () => {
+	// The config's roots are src/; lib/ is in the program only because src/ imports it.
+	const project = join(repository, "imports-lib");
+	mkdirSync(join(project, "src"), { recursive: true });
+	mkdirSync(join(project, "lib"), { recursive: true });
+	writeFileSync(
+		join(project, "tsconfig.json"),
+		'{"compilerOptions":{"strict":true,"module":"nodenext"},"include":["src"]}\n',
+	);
+	writeFileSync(
+		join(project, "src/app.ts"),
+		'import { shared } from "../lib/shared.js";\nexport const app = () => shared();\n',
+	);
+	const library = (body: string) =>
+		writeFileSync(
+			join(project, "lib/shared.ts"),
+			`export function shared() { return 1; }\nexport function caller() { return ${body}; }\n`,
+		);
+	library("shared()");
+	const lines = () =>
+		(
+			JSON.parse(
+				runIn(project, "--json", JSON.stringify({ type: "references", symbol: "lib/shared.ts#shared:function" })).out,
+			) as Array<{
+				nodes: Array<{ file: string; line: number }>;
+			}>
+		)[0]!.nodes.map(({ file, line }) => `${file}:${line}`);
+	try {
+		expect(lines()).toContain("lib/shared.ts:2");
+		library("0");
+		expect(lines()).not.toContain("lib/shared.ts:2");
+		// Gone and back again, it's seen once more.
+		unlinkSync(join(project, "lib/shared.ts"));
+		expect(
+			runIn(project, JSON.stringify({ type: "references", symbol: "lib/shared.ts#shared:function" })).code,
+		).not.toBe(0);
+		library("shared()");
+		expect(lines()).toContain("lib/shared.ts:2");
+	} finally {
+		runIn(project, "stop");
+	}
+});
+
+test("the reference index starts again when its process exits between queries", async () => {
+	const project = join(repository, "restart-index");
+	mkdirSync(project, { recursive: true });
+	writeFileSync(
+		join(project, "tsconfig.json"),
+		'{"compilerOptions":{"strict":true,"module":"nodenext"},"include":["*.ts"]}\n',
+	);
+	writeFileSync(join(project, "a.ts"), "export function target() { return 1; }\nexport const use = () => target();\n");
+	const index = createReferenceIndex({ root: project, tsconfig: join(project, "tsconfig.json") });
+	const paths = createPaths(project);
+	const lines = async () =>
+		(await index.query({ type: "references", symbol: "a.ts#target:function" }, paths)).nodes.map(({ line }) => line);
+	try {
+		expect(await lines()).toEqual([2]);
+		const pid = Number(
+			Bun.spawnSync(["pgrep", "-n", "-P", String(process.pid), "-f", "tsc --api --async --cwd"])
+				.stdout.toString()
+				.trim(),
+		);
+		// A failed lookup would be 0, which signals the whole process group.
+		expect(Number.isInteger(pid) && pid > 0).toBe(true);
+		process.kill(pid, "SIGKILL");
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(await lines()).toEqual([2]);
+	} finally {
+		await index.close();
+	}
+}, 30_000);
