@@ -16,7 +16,7 @@ jobs:
       - run: npm ci
       - run: npm run check
       # sightread is published as JavaScript that Node runs; this builds it and loads every module under Node.
-      - run: npm run build -w sightread
+      - run: npm run build -w @2mangoes/sightread
       - run: node packages/sightread/dist/cli.js --skill > /dev/null
 
   # test-linux:
